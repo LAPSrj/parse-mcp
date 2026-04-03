@@ -2,6 +2,8 @@
   "name": "parse-mcp",
   "version": "1.0.0",
   "description": "MCP server with scoped, read-only parsing tools (JSON, regex, HTML)",
+  "author": "Leandro Amorim <leandro@lemorim.com>",
+  "license": "PolyForm-Strict-1.0.0",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
