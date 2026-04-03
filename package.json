@@ -1,0 +1,29 @@
+{
+  "name": "parse-mcp",
+  "version": "1.0.0",
+  "description": "MCP server with scoped, read-only parsing tools (JSON, regex, HTML)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "parse-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "cheerio": "^1.0.0",
+    "jmespath": "^0.16.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/jmespath": "^0.15.2",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
