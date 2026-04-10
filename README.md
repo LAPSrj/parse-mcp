@@ -161,3 +161,24 @@ MCP client config using Node:
 Add the config to your MCP client settings (e.g. Claude Desktop `claude_desktop_config.json`, Claude Code `settings.json`, or VS Code MCP config).
 
 No environment variables are required. All tools accept input via `file_path` or inline `text` parameters.
+
+## CLAUDE.md rule
+
+Add the following to your project's `CLAUDE.md` so the agent prefers parse-mcp tools over writing one-off scripts:
+
+```markdown
+## Parsing & data extraction
+
+When you need to parse, query, or transform JSON, HTML, or text files, use the
+parse-mcp tools (json_query, json_transform, regex_extract, html_select,
+text_count) instead of writing custom scripts, shell pipelines, or inline code.
+
+- **JSON**: Use `json_query` with JMESPath for reads, `json_transform` for bulk
+  find/replace, field set/delete, or migration rewrites.
+- **HTML**: Use `html_select` with CSS selectors instead of regex or custom DOM
+  parsing.
+- **Regex**: Use `regex_extract` instead of grep pipelines or throwaway scripts.
+- **Counting**: Use `text_count` instead of `wc` or manual counting.
+
+All tools accept a `file_path` or inline `text` — no temp scripts needed.
+```
