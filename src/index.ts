@@ -960,10 +960,10 @@ server.tool(
     glob: z
       .string()
       .describe(
-        "Glob pattern. Absolute (e.g. '/var/log/**/*.log') or relative to cwd " +
+        "Glob pattern. Absolute (e.g. '/var/log/**/*.log') or relative to path " +
           "(e.g. '**/*.ts'). Supports **, *, ?, and {a,b} alternation."
       ),
-    cwd: z
+    path: z
       .string()
       .optional()
       .describe("Base directory for a relative glob (default: process cwd)"),
@@ -1004,7 +1004,7 @@ server.tool(
       .describe("Sort descending"),
     limit: z.number().optional().default(1000).describe("Max entries to return"),
   },
-  async ({ glob, cwd, since, until, min_size, max_size, type, stat: withStat, sort, desc, limit }) => {
+  async ({ glob, path: cwd, since, until, min_size, max_size, type, stat: withStat, sort, desc, limit }) => {
     const entries = await globFiles(glob, {
       cwd,
       since,
