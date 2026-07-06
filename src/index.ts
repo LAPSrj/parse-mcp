@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { readFile, writeFile, readdir, stat } from "fs/promises";
 import * as path from "path";
+import { Worker } from "worker_threads";
 import jmespath from "jmespath";
 import * as cheerio from "cheerio";
 
@@ -13,6 +14,143 @@ const server = new McpServer({
 });
 
 // ---------------------------------------------------------------------------
+// Safety limits
+//
+// This server does all of its work synchronously on Node's single event-loop
+// thread and talks JSON-RPC over stdio. If a tool call hangs (catastrophic
+// regex backtracking), exhausts memory (an unbounded result), or throws
+// asynchronously, the process stops answering the client and the transport is
+// torn down — what shows up as a "disconnect". The guards below keep any one
+// tool call from taking down the whole session.
+// ---------------------------------------------------------------------------
+
+/** Max bytes read from any single input file. Keeps in-memory structures (and
+ *  the transient cost of JSON.stringify) safely under the default V8 heap. */
+const MAX_INPUT_BYTES = 100 * 1024 * 1024; // 100 MB
+
+/** Max bytes of a single tool response. Larger payloads are truncated rather
+ *  than serialized unbounded. */
+const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB
+
+/** Wall-clock budget for a single user-supplied regex operation. */
+const REGEX_TIMEOUT_MS = 5000;
+
+/** Recursion-depth ceiling for the deep-* JSON walkers. */
+const MAX_DEPTH = 2000;
+
+/** Read a file as UTF-8, rejecting anything over MAX_INPUT_BYTES with a clean
+ *  error (which the SDK returns to the client instead of risking an OOM). */
+async function readFileCapped(p: string): Promise<string> {
+  const st = await stat(p);
+  if (st.size > MAX_INPUT_BYTES) {
+    throw new Error(
+      `File too large: ${st.size} bytes (max ${MAX_INPUT_BYTES}). ` +
+        `Narrow the input or split the file.`
+    );
+  }
+  return readFile(p, "utf-8");
+}
+
+/** Wrap a text payload as a tool result, truncating past MAX_OUTPUT_BYTES so a
+ *  huge result degrades gracefully instead of blowing up serialization. */
+function textResult(payload: string) {
+  let text = payload;
+  if (Buffer.byteLength(text, "utf-8") > MAX_OUTPUT_BYTES) {
+    // slice is by UTF-16 code units; a hair under the byte budget is fine.
+    text =
+      text.slice(0, MAX_OUTPUT_BYTES) +
+      `\n\n...[truncated: output exceeded ${MAX_OUTPUT_BYTES} bytes — ` +
+      `use limit / a narrower expression to reduce it]`;
+  }
+  return { content: [{ type: "text" as const, text }] };
+}
+
+// The CPU-bound regex primitives run in a worker thread so a catastrophic
+// backtracking pattern can be killed with worker.terminate() (a stuck
+// synchronous regex is otherwise uninterruptible and hangs the whole server).
+const REGEX_WORKER = `
+const { parentPort, workerData } = require('worker_threads');
+try {
+  const { content, pattern, flags, group, count_only, collectLimit } = workerData;
+  const regex = new RegExp(pattern, flags);
+  const isGlobal = flags.includes('g');
+  if (count_only) {
+    let count = 0, m;
+    while ((m = regex.exec(content)) !== null) {
+      count++;
+      if (m[0] === '' && isGlobal) regex.lastIndex++;
+      if (!isGlobal) break;
+      if (count >= 1000000) break;
+    }
+    parentPort.postMessage({ result: { count } });
+  } else {
+    const matches = [];
+    let m;
+    while ((m = regex.exec(content)) !== null && matches.length < collectLimit) {
+      if (group !== undefined && group !== null && m[group] !== undefined) matches.push(m[group]);
+      else matches.push(m[0]);
+      if (m[0] === '' && isGlobal) regex.lastIndex++;
+      if (!isGlobal) break;
+    }
+    parentPort.postMessage({ result: { matches } });
+  }
+} catch (e) {
+  parentPort.postMessage({ error: e.message });
+}
+`;
+
+const REPLACE_WORKER = `
+const { parentPort, workerData } = require('worker_threads');
+try {
+  const { text, from, to, flags } = workerData;
+  const counter = new RegExp(from, flags);
+  const matches = text.match(counter);
+  const count = matches ? matches.length : 0;
+  const result = text.replace(new RegExp(from, flags), to);
+  parentPort.postMessage({ result: { result, count } });
+} catch (e) {
+  parentPort.postMessage({ error: e.message });
+}
+`;
+
+/** Run one of the worker scripts above with a hard wall-clock timeout,
+ *  terminating the worker (and its stuck regex, if any) if it overruns. */
+function runInWorker<T>(
+  code: string,
+  workerData: unknown,
+  timeoutMs: number
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(code, { eval: true, workerData });
+    let done = false;
+    const finish = (fn: () => void) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      worker.terminate();
+      fn();
+    };
+    const timer = setTimeout(() => {
+      finish(() =>
+        reject(
+          new Error(
+            `Operation timed out after ${timeoutMs}ms — likely catastrophic ` +
+              `regex backtracking. Simplify the pattern (avoid nested quantifiers ` +
+              `like (a+)+) or anchor it more tightly.`
+          )
+        )
+      );
+    }, timeoutMs);
+    worker.on("message", (msg: { result?: T; error?: string }) => {
+      finish(() =>
+        msg.error ? reject(new Error(msg.error)) : resolve(msg.result as T)
+      );
+    });
+    worker.on("error", (err) => finish(() => reject(err)));
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -20,27 +158,30 @@ async function resolveContent(
   filePath?: string,
   text?: string
 ): Promise<string> {
-  if (filePath) return readFile(filePath, "utf-8");
+  if (filePath) return readFileCapped(filePath);
   if (text) return text;
   throw new Error("Provide either file_path or text");
 }
 
 /** Recursively parse any string values that look like JSON. */
-function deepParseJson(data: unknown): unknown {
+function deepParseJson(data: unknown, depth = 0): unknown {
+  if (depth > MAX_DEPTH) {
+    throw new Error(`Maximum nesting depth (${MAX_DEPTH}) exceeded`);
+  }
   if (typeof data === "string") {
     try {
-      return deepParseJson(JSON.parse(data));
+      return deepParseJson(JSON.parse(data), depth + 1);
     } catch {
       return data;
     }
   }
   if (Array.isArray(data)) {
-    return data.map(deepParseJson);
+    return data.map((item) => deepParseJson(item, depth + 1));
   }
   if (data && typeof data === "object") {
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(data)) {
-      result[key] = deepParseJson(value);
+      result[key] = deepParseJson(value, depth + 1);
     }
     return result;
   }
@@ -50,8 +191,12 @@ function deepParseJson(data: unknown): unknown {
 /** Apply find/replace pairs to every string value in a JSON tree. */
 function deepReplace(
   data: unknown,
-  replacements: Array<{ from: string; to: string; regex?: boolean }>
+  replacements: Array<{ from: string; to: string; regex?: boolean }>,
+  depth = 0
 ): unknown {
+  if (depth > MAX_DEPTH) {
+    throw new Error(`Maximum nesting depth (${MAX_DEPTH}) exceeded`);
+  }
   if (typeof data === "string") {
     let result = data;
     for (const { from, to, regex } of replacements) {
@@ -64,12 +209,12 @@ function deepReplace(
     return result;
   }
   if (Array.isArray(data)) {
-    return data.map((item) => deepReplace(item, replacements));
+    return data.map((item) => deepReplace(item, replacements, depth + 1));
   }
   if (data && typeof data === "object") {
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(data)) {
-      result[key] = deepReplace(value, replacements);
+      result[key] = deepReplace(value, replacements, depth + 1);
     }
     return result;
   }
@@ -475,15 +620,15 @@ server.tool(
       result = result.slice(0, limit);
     }
 
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-    };
+    return textResult(JSON.stringify(result, null, 2));
   }
 );
 
 /** Core regex extraction over one string. Returns the count, the deduped
- *  frequency list, or the raw match list depending on the flags. */
-function runRegex(
+ *  frequency list, or the raw match list depending on the flags. The regex
+ *  itself runs in a worker thread with REGEX_TIMEOUT_MS so a catastrophic
+ *  backtracking pattern is killed instead of hanging the server. */
+async function runRegex(
   content: string,
   opts: {
     pattern: string;
@@ -493,32 +638,21 @@ function runRegex(
     count_only: boolean;
     unique: boolean;
   }
-): unknown {
+): Promise<unknown> {
   const { pattern, flags, group, limit, count_only, unique } = opts;
-  const regex = new RegExp(pattern, flags);
+  const collectLimit = unique ? 10_000 : limit;
+
+  const out = await runInWorker<{ count?: number; matches?: string[] }>(
+    REGEX_WORKER,
+    { content, pattern, flags, group, count_only, collectLimit },
+    REGEX_TIMEOUT_MS
+  );
 
   if (count_only) {
-    let count = 0;
-    while (regex.exec(content) !== null) {
-      count++;
-      if (!flags.includes("g")) break;
-      if (count >= 1_000_000) break;
-    }
-    return { count };
+    return { count: out.count ?? 0 };
   }
 
-  const collectLimit = unique ? 10_000 : limit;
-  const matches: string[] = [];
-
-  let match;
-  while ((match = regex.exec(content)) !== null && matches.length < collectLimit) {
-    if (group !== undefined && match[group] !== undefined) {
-      matches.push(match[group]);
-    } else {
-      matches.push(match[0]);
-    }
-    if (!flags.includes("g")) break;
-  }
+  const matches = out.matches ?? [];
 
   if (unique) {
     const freq = new Map<string, number>();
@@ -599,23 +733,17 @@ server.tool(
       const results = [];
       for (const f of files) {
         try {
-          const content = await readFile(f, "utf-8");
-          results.push({ file: f, result: runRegex(content, opts) });
+          const content = await readFileCapped(f);
+          results.push({ file: f, result: await runRegex(content, opts) });
         } catch (err) {
           results.push({ file: f, error: (err as Error).message });
         }
       }
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }],
-      };
+      return textResult(JSON.stringify(results, null, 2));
     }
 
     const content = await resolveContent(file_path, text);
-    return {
-      content: [
-        { type: "text" as const, text: JSON.stringify(runRegex(content, opts), null, 2) },
-      ],
-    };
+    return textResult(JSON.stringify(await runRegex(content, opts), null, 2));
   }
 );
 
@@ -665,9 +793,7 @@ server.tool(
       }
     });
 
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }],
-    };
+    return textResult(JSON.stringify(results, null, 2));
   }
 );
 
@@ -769,9 +895,7 @@ server.tool(
       };
     }
 
-    return {
-      content: [{ type: "text" as const, text: output }],
-    };
+    return textResult(output);
   }
 );
 
@@ -889,7 +1013,7 @@ server.tool(
       const files = await resolvePaths({ file_path, paths, glob, cwd });
       for (const f of files) {
         try {
-          sources.push([f, await readFile(f, "utf-8")]);
+          sources.push([f, await readFileCapped(f)]);
         } catch {
           /* unreadable file → skipped */
         }
@@ -931,23 +1055,12 @@ server.tool(
         .map(([key, count]) => ({ key, count }))
         .sort((a, b) => b.count - a.count)
         .slice(0, limit);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              { scanned, matched, groups: sorted },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      return textResult(
+        JSON.stringify({ scanned, matched, groups: sorted }, null, 2)
+      );
     }
 
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(records, null, 2) }],
-    };
+    return textResult(JSON.stringify(records, null, 2));
   }
 );
 
@@ -1027,18 +1140,13 @@ server.tool(
       ? sliced.map(({ path, size, mtime, type }) => ({ path, size, mtime, type }))
       : sliced.map((e) => e.path);
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            { count: entries.length, returned: sliced.length, files: payload },
-            null,
-            2
-          ),
-        },
-      ],
-    };
+    return textResult(
+      JSON.stringify(
+        { count: entries.length, returned: sliced.length, files: payload },
+        null,
+        2
+      )
+    );
   }
 );
 
@@ -1120,7 +1228,7 @@ server.tool(
       for (const f of files) {
         try {
           all.push(
-            ...rowsToObjects(parseDelimited(await readFile(f, "utf-8"), delimiter), header)
+            ...rowsToObjects(parseDelimited(await readFileCapped(f), delimiter), header)
           );
         } catch {
           /* unreadable file → skipped */
@@ -1160,14 +1268,9 @@ server.tool(
         })
         .sort((a, b) => (b.count as number) - (a.count as number))
         .slice(0, limit);
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ scanned: all.length, matched: kept.length, groups }, null, 2),
-          },
-        ],
-      };
+      return textResult(
+        JSON.stringify({ scanned: all.length, matched: kept.length, groups }, null, 2)
+      );
     }
 
     const projected = kept.slice(0, limit).map((r) => {
@@ -1180,9 +1283,7 @@ server.tool(
       return r;
     });
 
-    return {
-      content: [{ type: "text" as const, text: JSON.stringify(projected, null, 2) }],
-    };
+    return textResult(JSON.stringify(projected, null, 2));
   }
 );
 
@@ -1224,11 +1325,16 @@ server.tool(
     let total = 0;
     for (const { from, to, regex, flags } of replacements) {
       if (regex) {
+        // Run the (user-supplied) regex in a worker with a timeout so a
+        // catastrophic pattern is killed instead of hanging the server.
         const f = flags.includes("g") ? flags : flags + "g";
-        const counter = new RegExp(from, f);
-        const matches = result.match(counter);
-        total += matches ? matches.length : 0;
-        result = result.replace(new RegExp(from, f), to);
+        const out = await runInWorker<{ result: string; count: number }>(
+          REPLACE_WORKER,
+          { text: result, from, to, flags: f },
+          REGEX_TIMEOUT_MS
+        );
+        total += out.count;
+        result = out.result;
       } else {
         const parts = result.split(from);
         total += parts.length - 1;
@@ -1251,15 +1357,25 @@ server.tool(
       };
     }
 
-    return {
-      content: [{ type: "text" as const, text: result }],
-    };
+    return textResult(result);
   }
 );
 
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
+
+// Last-resort guards: a stray async throw or rejected promise would otherwise
+// crash the process and drop the stdio transport (a "disconnect"). Log to
+// stderr (stdout is the JSON-RPC channel) and keep the server alive. Note an
+// out-of-memory abort is uncatchable by design — the input-size cap is what
+// keeps us clear of that.
+process.on("uncaughtException", (err) => {
+  console.error("[parse-mcp] uncaughtException:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[parse-mcp] unhandledRejection:", reason);
+});
 
 async function main() {
   const transport = new StdioServerTransport();
