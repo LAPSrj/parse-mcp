@@ -164,14 +164,16 @@ Total quantity per region across a CSV:
 
 ### regex_extract
 
-Extract regex matches from a file, inline text, or many files at once (`paths`/`glob`). With a glob or paths array, returns one `{file, result}` per file.
+Extract regex matches from a file, inline text, or many files at once (`paths`/`glob`).
+
+With a single `file_path`/`text`, returns the matches directly. With a glob or paths array, returns `{scanned, matched, results}`, where `results` holds one `{file, result}` per file **that matched** — files with no matches are omitted, so `scanned` is the total examined and `matched` is `results.length`. A file whose regex overruns the per-file timeout is reported as `{file, error}` and the scan continues past it. If the whole call exceeds its budget, a `note` field says so and the results are partial.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `file_path` | string? | | Absolute path to the file |
 | `text` | string? | | Inline text (alternative to file_path) |
-| `paths` | string[]? | | Multiple file paths to scan; returns one result per file |
-| `glob` | string? | | Glob (e.g. `**/*.ts`) to scan many files; returns one result per file |
+| `paths` | string[]? | | Multiple file paths to scan; returns one result per matching file |
+| `glob` | string? | | Glob (e.g. `**/*.ts`) to scan many files; returns one result per matching file |
 | `cwd` | string? | | Base directory for a relative glob |
 | `pattern` | string | | Regular expression pattern |
 | `flags` | string? | `"g"` | Regex flags |

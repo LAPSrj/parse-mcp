@@ -32,8 +32,15 @@ const MAX_INPUT_BYTES = 100 * 1024 * 1024; // 100 MB
  *  than serialized unbounded. */
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB
 
-/** Wall-clock budget for a single user-supplied regex operation. */
+/** Wall-clock budget for a single user-supplied regex operation against one
+ *  input. Enforced as an idle watchdog: the scan worker heartbeats before each
+ *  file, so this bounds any single file, not the whole call. */
 const REGEX_TIMEOUT_MS = 5000;
+
+/** Wall-clock budget for an entire multi-file tool call. A glob that matches
+ *  more work than this returns partial results plus a note, rather than going
+ *  silent for minutes. */
+const CALL_BUDGET_MS = 60_000;
 
 /** Recursion-depth ceiling for the deep-* JSON walkers. */
 const MAX_DEPTH = 2000;
@@ -68,6 +75,11 @@ function textResult(payload: string) {
 // The CPU-bound regex primitives run in a worker thread so a catastrophic
 // backtracking pattern can be killed with worker.terminate() (a stuck
 // synchronous regex is otherwise uninterruptible and hangs the whole server).
+//
+// Cost note: spawning a worker is ~17ms. That is negligible once per call and
+// ruinous once per file — a 76k-file glob spent ~22 minutes on spawns alone to
+// guard a regex that took 0.13s in total. So the multi-file path uses ONE
+// worker for the whole batch (SCAN_WORKER below), not one per file.
 const REGEX_WORKER = `
 const { parentPort, workerData } = require('worker_threads');
 try {
@@ -96,6 +108,73 @@ try {
   }
 } catch (e) {
   parentPort.postMessage({ error: e.message });
+}
+`;
+
+// Scans many files inside a single worker. Reads with sync I/O on purpose: this
+// thread has nothing else to do, so blocking is free, and awaited readFile costs
+// ~10x more than readFileSync across many small files (median match is ~1 KB).
+//
+// Protocol back to the main thread:
+//   { h: i }          heartbeat — about to touch files[i]; resets the watchdog
+//   { i, entry }      a file with matches or an error (silent files are omitted)
+//   { done: true }    batch finished
+//   { fatal: msg }    the pattern itself is invalid — nothing was scanned
+const SCAN_WORKER = `
+const { parentPort, workerData } = require('worker_threads');
+const { readFileSync, statSync } = require('fs');
+const {
+  files, sizes, pattern, flags, group, count_only, collectLimit, maxInputBytes
+} = workerData;
+const isGlobal = flags.includes('g');
+
+function scanOne(content) {
+  const regex = new RegExp(pattern, flags);
+  if (count_only) {
+    let count = 0, m;
+    while ((m = regex.exec(content)) !== null) {
+      count++;
+      if (m[0] === '' && isGlobal) regex.lastIndex++;
+      if (!isGlobal) break;
+      if (count >= 1000000) break;
+    }
+    return { count: count };
+  }
+  const matches = [];
+  let m;
+  while ((m = regex.exec(content)) !== null && matches.length < collectLimit) {
+    if (group !== undefined && group !== null && m[group] !== undefined) matches.push(m[group]);
+    else matches.push(m[0]);
+    if (m[0] === '' && isGlobal) regex.lastIndex++;
+    if (!isGlobal) break;
+  }
+  return { matches: matches };
+}
+
+try {
+  new RegExp(pattern, flags); // fail fast rather than once per file
+  for (let i = 0; i < files.length; i++) {
+    parentPort.postMessage({ h: i });
+    var entry;
+    try {
+      // sizes[i] >= 0 means the glob walk already stat()ed this file; reusing
+      // that avoids a second stat syscall per file.
+      const size = sizes[i] >= 0 ? sizes[i] : statSync(files[i]).size;
+      if (size > maxInputBytes) {
+        entry = { error: 'File too large: ' + size + ' bytes (max ' + maxInputBytes + '). Narrow the input or split the file.' };
+      } else {
+        entry = { result: scanOne(readFileSync(files[i], 'utf-8')) };
+      }
+    } catch (e) {
+      entry = { error: e.message };
+    }
+    const r = entry.result;
+    const silent = r && (count_only ? !r.count : r.matches.length === 0);
+    if (!silent) parentPort.postMessage({ i: i, entry: entry });
+  }
+  parentPort.postMessage({ done: true });
+} catch (e) {
+  parentPort.postMessage({ fatal: e.message });
 }
 `;
 
@@ -148,6 +227,205 @@ function runInWorker<T>(
     });
     worker.on("error", (err) => finish(() => reject(err)));
   });
+}
+
+interface RegexOpts {
+  pattern: string;
+  flags: string;
+  group?: number;
+  limit: number;
+  count_only: boolean;
+  unique: boolean;
+}
+
+interface BatchOutcome {
+  entries: Array<{ i: number; entry: { result?: RawScan; error?: string } }>;
+  /** Index (within this batch) of the file the worker hung on, if it hung. */
+  stalledAt?: number;
+  /** True when the call-level budget expired mid-batch. */
+  budgetHit: boolean;
+  /** Files confirmed started; used to report progress on a partial run. */
+  reached: number;
+}
+
+type RawScan = { count?: number; matches?: string[] };
+
+/** Run one batch of files through a single scan worker.
+ *
+ *  The worker heartbeats before each file, which arms a per-file idle watchdog.
+ *  A stuck regex stops the heartbeats, the watchdog fires, and terminate() kills
+ *  it — the same guarantee the old worker-per-file design gave, for one spawn
+ *  instead of N. A separate un-resettable timer enforces the call budget. */
+function scanBatch(
+  files: string[],
+  sizes: number[],
+  opts: RegexOpts,
+  budgetMs: number
+): Promise<BatchOutcome> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(SCAN_WORKER, {
+      eval: true,
+      workerData: {
+        files,
+        sizes,
+        pattern: opts.pattern,
+        flags: opts.flags,
+        group: opts.group,
+        count_only: opts.count_only,
+        collectLimit: opts.unique ? 10_000 : opts.limit,
+        maxInputBytes: MAX_INPUT_BYTES,
+      },
+    });
+
+    const entries: BatchOutcome["entries"] = [];
+    let current = -1;
+    let settled = false;
+    let idleTimer: NodeJS.Timeout;
+
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(idleTimer);
+      clearTimeout(budgetTimer);
+      worker.terminate();
+      fn();
+    };
+
+    const armIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        finish(() =>
+          resolve({ entries, stalledAt: current, budgetHit: false, reached: current })
+        );
+      }, REGEX_TIMEOUT_MS);
+    };
+
+    const budgetTimer = setTimeout(() => {
+      finish(() => resolve({ entries, budgetHit: true, reached: current }));
+    }, budgetMs);
+
+    armIdle();
+
+    worker.on("message", (msg: any) => {
+      if (msg.done) {
+        finish(() =>
+          resolve({ entries, budgetHit: false, reached: files.length })
+        );
+      } else if (msg.fatal) {
+        finish(() => reject(new Error(msg.fatal)));
+      } else if (msg.h !== undefined) {
+        current = msg.h;
+        armIdle();
+      } else if (msg.entry) {
+        entries.push(msg);
+      }
+    });
+    worker.on("error", (err) => finish(() => reject(err)));
+  });
+}
+
+/** Turn a worker's raw scan into the tool's user-facing shape (count / unique
+ *  frequency list / plain match list). Kept on the main thread so the worker
+ *  stays a dumb, terminable scanner. */
+function finalizeScan(raw: RawScan, opts: RegexOpts): unknown {
+  if (opts.count_only) return { count: raw.count ?? 0 };
+  const matches = raw.matches ?? [];
+  if (opts.unique) {
+    const freq = new Map<string, number>();
+    for (const m of matches) freq.set(m, (freq.get(m) || 0) + 1);
+    return [...freq.entries()]
+      .map(([m, count]) => ({ match: m, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, opts.limit);
+  }
+  return matches;
+}
+
+interface ScanReport {
+  results: Array<{ file: string; result?: unknown; error?: string }>;
+  scanned: number;
+  note?: string;
+}
+
+/** Scan many files under a single call budget.
+ *
+ *  A file that hangs the regex is recorded as an error and the scan RESUMES
+ *  after it in a fresh worker, so one pathological file can't sink the batch. */
+async function scanFiles(
+  resolved: ResolvedFile[],
+  opts: RegexOpts
+): Promise<ScanReport> {
+  const paths = resolved.map((r) => r.path);
+  const sizes = resolved.map((r) => r.size);
+  const results: ScanReport["results"] = [];
+  const deadline = Date.now() + CALL_BUDGET_MS;
+  let start = 0;
+  let note: string | undefined;
+
+  while (start < paths.length) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      note =
+        `Call budget of ${CALL_BUDGET_MS}ms expired after scanning ${start} of ` +
+        `${paths.length} matched files. Results are PARTIAL — narrow the glob ` +
+        `(or raise limit-scoping) and re-run.`;
+      break;
+    }
+
+    const out = await scanBatch(
+      paths.slice(start),
+      sizes.slice(start),
+      opts,
+      remaining
+    );
+
+    for (const m of out.entries) {
+      const abs = start + m.i;
+      if (m.entry.error) {
+        results.push({ file: resolved[abs].display, error: m.entry.error });
+      } else {
+        results.push({
+          file: resolved[abs].display,
+          result: finalizeScan(m.entry.result as RawScan, opts),
+        });
+      }
+    }
+
+    if (out.budgetHit) {
+      const done = start + Math.max(0, out.reached);
+      note =
+        `Call budget of ${CALL_BUDGET_MS}ms expired after scanning ~${done} of ` +
+        `${paths.length} matched files. Results are PARTIAL — narrow the glob ` +
+        `and re-run.`;
+      start = done;
+      break;
+    }
+
+    if (out.stalledAt !== undefined) {
+      // No heartbeat at all: the worker never got going. Fail loudly rather
+      // than fall through and report the batch as cleanly completed.
+      if (out.stalledAt < 0) {
+        throw new Error(
+          `Scan worker produced no heartbeat within ${REGEX_TIMEOUT_MS}ms — ` +
+            `it failed to start. Nothing was scanned.`
+        );
+      }
+      const bad = start + out.stalledAt;
+      results.push({
+        file: resolved[bad].display,
+        error:
+          `Timed out after ${REGEX_TIMEOUT_MS}ms — likely catastrophic regex ` +
+          `backtracking on this file. Simplify the pattern (avoid nested ` +
+          `quantifiers like (a+)+) or anchor it more tightly. Skipped; scan continued.`,
+      });
+      start = bad + 1; // step over the offender and keep going
+      continue;
+    }
+
+    start = paths.length; // clean completion
+  }
+
+  return { results, scanned: start, note };
 }
 
 // ---------------------------------------------------------------------------
@@ -289,11 +567,24 @@ function deleteAtPath(data: unknown, path: string): void {
 // ---------------------------------------------------------------------------
 
 interface FileEntry {
+  /** Display path — relative to cwd when the glob was relative. */
   path: string;
+  /** Absolute path. Always use this to open the file: a relative display path
+   *  would otherwise be re-resolved against process.cwd(), which is NOT the
+   *  same directory as an explicitly-passed cwd. */
+  fullPath: string;
   size: number;
   mtime: string;
   mtimeMs: number;
   type: "file" | "dir";
+}
+
+/** A file to scan: where to read it, what to call it, and its size if the glob
+ *  walk already stat()ed it (-1 when unknown). */
+interface ResolvedFile {
+  path: string;
+  display: string;
+  size: number;
 }
 
 /** Translate a single glob pattern segment-string into an anchored RegExp.
@@ -416,6 +707,7 @@ async function globFiles(glob: string, opts: GlobOpts = {}): Promise<FileEntry[]
     if (opts.maxSize !== undefined && st.size > opts.maxSize) return;
     out.push({
       path: display(full),
+      fullPath: full,
       size: st.size,
       mtime: new Date(st.mtimeMs).toISOString(),
       mtimeMs: st.mtimeMs,
@@ -456,19 +748,27 @@ async function globFiles(glob: string, opts: GlobOpts = {}): Promise<FileEntry[]
   return out;
 }
 
-/** Resolve a multi-source input into a list of file paths. */
+/** Resolve a multi-source input into files to scan.
+ *
+ *  The glob walk has already stat()ed every match, so its size rides along and
+ *  the reader can skip a second stat. Explicit paths carry -1 (unknown). */
 async function resolvePaths(args: {
   file_path?: string;
   paths?: string[];
   glob?: string;
   cwd?: string;
-}): Promise<string[]> {
-  if (args.paths && args.paths.length) return args.paths;
+}): Promise<ResolvedFile[]> {
+  const bare = (p: string): ResolvedFile => ({ path: p, display: p, size: -1 });
+  if (args.paths && args.paths.length) return args.paths.map(bare);
   if (args.glob) {
     const entries = await globFiles(args.glob, { cwd: args.cwd, type: "file" });
-    return entries.map((e) => e.path);
+    return entries.map((e) => ({
+      path: e.fullPath,
+      display: e.path,
+      size: e.size,
+    }));
   }
-  if (args.file_path) return [args.file_path];
+  if (args.file_path) return [bare(args.file_path)];
   return [];
 }
 
@@ -581,11 +881,13 @@ function aggregateValues(values: number[], op: string): number {
 // Tools
 // ---------------------------------------------------------------------------
 
-server.tool(
+server.registerTool(
   "json_query",
-  "Query JSON data using a JMESPath expression. Can read from a file or inline text. " +
-    "Use parse_nested to automatically parse JSON strings embedded inside values.",
   {
+  description:
+    "Query JSON data using a JMESPath expression. Can read from a file or inline text. " +
+    "Use parse_nested to automatically parse JSON strings embedded inside values.",
+  inputSchema: z.object({
     file_path: z
       .string()
       .optional()
@@ -605,6 +907,7 @@ server.tool(
       .optional()
       .default(50)
       .describe("Max array items to return"),
+  }).strict(),
   },
   async ({ file_path, text, expression, parse_nested, limit }) => {
     const raw = await resolveContent(file_path, text);
@@ -624,55 +927,31 @@ server.tool(
   }
 );
 
-/** Core regex extraction over one string. Returns the count, the deduped
- *  frequency list, or the raw match list depending on the flags. The regex
- *  itself runs in a worker thread with REGEX_TIMEOUT_MS so a catastrophic
- *  backtracking pattern is killed instead of hanging the server. */
-async function runRegex(
-  content: string,
-  opts: {
-    pattern: string;
-    flags: string;
-    group?: number;
-    limit: number;
-    count_only: boolean;
-    unique: boolean;
-  }
-): Promise<unknown> {
+/** Core regex extraction over one in-memory string (inline text, or a single
+ *  file_path). One worker per call is fine here — it's one call. The multi-file
+ *  path goes through scanFiles() instead, which must not pay this per file. */
+async function runRegex(content: string, opts: RegexOpts): Promise<unknown> {
   const { pattern, flags, group, limit, count_only, unique } = opts;
   const collectLimit = unique ? 10_000 : limit;
 
-  const out = await runInWorker<{ count?: number; matches?: string[] }>(
+  const out = await runInWorker<RawScan>(
     REGEX_WORKER,
     { content, pattern, flags, group, count_only, collectLimit },
     REGEX_TIMEOUT_MS
   );
 
-  if (count_only) {
-    return { count: out.count ?? 0 };
-  }
-
-  const matches = out.matches ?? [];
-
-  if (unique) {
-    const freq = new Map<string, number>();
-    for (const m of matches) {
-      freq.set(m, (freq.get(m) || 0) + 1);
-    }
-    return [...freq.entries()]
-      .map(([m, count]) => ({ match: m, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, limit);
-  }
-
-  return matches;
+  return finalizeScan(out, opts);
 }
 
-server.tool(
+server.registerTool(
   "regex_extract",
-  "Extract regex matches from a file, inline text, or many files at once " +
-    "(paths/glob). With a glob or paths array, returns per-file results.",
   {
+  description:
+    "Extract regex matches from a file, inline text, or many files at once " +
+    "(paths/glob). With a glob or paths array, returns per-file results for the " +
+    "files that matched — files with no matches are omitted; see `scanned` for " +
+    "the total examined.",
+  inputSchema: z.object({
     file_path: z.string().optional().describe("Absolute path to the file"),
     text: z
       .string()
@@ -711,6 +990,7 @@ server.tool(
       .describe(
         "Deduplicate matches and return [{match, count}] sorted by frequency (like sort | uniq -c)"
       ),
+  }).strict(),
   },
   async ({
     file_path,
@@ -725,21 +1005,24 @@ server.tool(
     count_only,
     unique,
   }) => {
-    const opts = { pattern, flags, group, limit, count_only, unique };
+    const opts: RegexOpts = { pattern, flags, group, limit, count_only, unique };
     const multi = (paths && paths.length) || glob;
 
     if (multi) {
       const files = await resolvePaths({ file_path, paths, glob, cwd });
-      const results = [];
-      for (const f of files) {
-        try {
-          const content = await readFileCapped(f);
-          results.push({ file: f, result: await runRegex(content, opts) });
-        } catch (err) {
-          results.push({ file: f, error: (err as Error).message });
-        }
-      }
-      return textResult(JSON.stringify(results, null, 2));
+      const { results, scanned, note } = await scanFiles(files, opts);
+      return textResult(
+        JSON.stringify(
+          {
+            scanned,
+            matched: results.length,
+            ...(note ? { note } : {}),
+            results,
+          },
+          null,
+          2
+        )
+      );
     }
 
     const content = await resolveContent(file_path, text);
@@ -747,10 +1030,11 @@ server.tool(
   }
 );
 
-server.tool(
+server.registerTool(
   "html_select",
-  "Extract elements from HTML using CSS selectors.",
   {
+  description: "Extract elements from HTML using CSS selectors.",
+  inputSchema: z.object({
     file_path: z
       .string()
       .optional()
@@ -774,6 +1058,7 @@ server.tool(
       .optional()
       .default(50)
       .describe("Max elements to return"),
+  }).strict(),
   },
   async ({ file_path, text, selector, attribute, output, limit }) => {
     const raw = await resolveContent(file_path, text);
@@ -797,12 +1082,14 @@ server.tool(
   }
 );
 
-server.tool(
+server.registerTool(
   "json_transform",
-  "Transform JSON data: apply string replacements across all values, set or delete fields " +
+  {
+  description:
+    "Transform JSON data: apply string replacements across all values, set or delete fields " +
     "by path, and optionally write the result to a file. Designed for content migration " +
     "(URL rewrites, ID swaps) and bulk JSON manipulation without ad-hoc scripts.",
-  {
+  inputSchema: z.object({
     file_path: z
       .string()
       .optional()
@@ -852,6 +1139,7 @@ server.tool(
       .string()
       .optional()
       .describe("If provided, write the result to this file and return a confirmation instead of the full JSON"),
+  }).strict(),
   },
   async ({
     file_path,
@@ -899,10 +1187,12 @@ server.tool(
   }
 );
 
-server.tool(
+server.registerTool(
   "text_count",
-  "Count lines, words, characters, and bytes in a file or inline text (like wc).",
   {
+  description:
+    "Count lines, words, characters, and bytes in a file or inline text (like wc).",
+  inputSchema: z.object({
     file_path: z
       .string()
       .optional()
@@ -911,6 +1201,7 @@ server.tool(
       .string()
       .optional()
       .describe("Inline text (alternative to file_path)"),
+  }).strict(),
   },
   async ({ file_path, text }) => {
     const content = await resolveContent(file_path, text);
@@ -930,14 +1221,16 @@ server.tool(
   }
 );
 
-server.tool(
+server.registerTool(
   "jsonl_query",
-  "Query newline-delimited JSON (JSONL/NDJSON) — transcripts, logs, exports — " +
+  {
+  description:
+    "Query newline-delimited JSON (JSONL/NDJSON) — transcripts, logs, exports — " +
     "one JSON object per line. Applies a JMESPath expression per record, with " +
     "optional filtering, group-by aggregation, and multi-file fan-out. " +
     "Unparseable lines are skipped. This is what json_query cannot do: it parses " +
     "a single document, JSONL is many.",
-  {
+  inputSchema: z.object({
     file_path: z.string().optional().describe("Absolute path to a .jsonl file"),
     text: z
       .string()
@@ -991,6 +1284,7 @@ server.tool(
       .optional()
       .default(100)
       .describe("Max results (records or groups) to return"),
+  }).strict(),
   },
   async ({
     file_path,
@@ -1013,7 +1307,7 @@ server.tool(
       const files = await resolvePaths({ file_path, paths, glob, cwd });
       for (const f of files) {
         try {
-          sources.push([f, await readFileCapped(f)]);
+          sources.push([f.display, await readFileCapped(f.path)]);
         } catch {
           /* unreadable file → skipped */
         }
@@ -1064,12 +1358,14 @@ server.tool(
   }
 );
 
-server.tool(
+server.registerTool(
   "file_list",
-  "List files matching a glob, with optional mtime / size / type filters and " +
+  {
+  description:
+    "List files matching a glob, with optional mtime / size / type filters and " +
     "sorting — a structured replacement for `find`/`ls`. The natural front half " +
     "of a parse workflow: list the files, then query their contents.",
-  {
+  inputSchema: z.object({
     glob: z
       .string()
       .describe(
@@ -1116,6 +1412,7 @@ server.tool(
       .default(false)
       .describe("Sort descending"),
     limit: z.number().optional().default(1000).describe("Max entries to return"),
+  }).strict(),
   },
   async ({ glob, path: cwd, since, until, min_size, max_size, type, stat: withStat, sort, desc, limit }) => {
     const entries = await globFiles(glob, {
@@ -1150,14 +1447,16 @@ server.tool(
   }
 );
 
-server.tool(
+server.registerTool(
   "csv_query",
-  "Query delimited text (CSV / TSV / whitespace columns) — select columns, " +
+  {
+  description:
+    "Query delimited text (CSV / TSV / whitespace columns) — select columns, " +
     "filter rows, and group-by with count/sum/avg/min/max aggregation. Each row " +
     "becomes a record object addressable by header name (or c0,c1,… when header " +
     "is false), so filter/expression/group_by all take JMESPath. Replaces " +
     "awk/cut for column work; supports multi-file paths/glob.",
-  {
+  inputSchema: z.object({
     file_path: z.string().optional().describe("Absolute path to a delimited file"),
     text: z.string().optional().describe("Inline delimited text (alternative to file_path)"),
     paths: z
@@ -1202,6 +1501,7 @@ server.tool(
       .optional()
       .describe("Column to aggregate numerically when agg is sum/avg/min/max"),
     limit: z.number().optional().default(100).describe("Max rows or groups to return"),
+  }).strict(),
   },
   async ({
     file_path,
@@ -1228,7 +1528,10 @@ server.tool(
       for (const f of files) {
         try {
           all.push(
-            ...rowsToObjects(parseDelimited(await readFileCapped(f), delimiter), header)
+            ...rowsToObjects(
+              parseDelimited(await readFileCapped(f.path), delimiter),
+              header
+            )
           );
         } catch {
           /* unreadable file → skipped */
@@ -1287,13 +1590,15 @@ server.tool(
   }
 );
 
-server.tool(
+server.registerTool(
   "text_replace",
-  "Find/replace on plain text or a file — literal or regex, applied in order, " +
+  {
+  description:
+    "Find/replace on plain text or a file — literal or regex, applied in order, " +
     "with optional write-to-file. The plain-text counterpart to json_transform " +
     "(which only operates on JSON trees); replaces `sed s/.../.../`. Regex " +
     "replacements support capture-group references ($1, $2) in the replacement.",
-  {
+  inputSchema: z.object({
     file_path: z.string().optional().describe("Absolute path to the file"),
     text: z.string().optional().describe("Inline text (alternative to file_path)"),
     replacements: z
@@ -1319,6 +1624,7 @@ server.tool(
       .string()
       .optional()
       .describe("If provided, write the result here and return a summary instead of the text"),
+  }).strict(),
   },
   async ({ file_path, text, replacements, output_file }) => {
     let result = await resolveContent(file_path, text);
