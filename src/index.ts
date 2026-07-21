@@ -84,7 +84,10 @@ const REGEX_WORKER = `
 const { parentPort, workerData } = require('worker_threads');
 try {
   const { content, pattern, flags, group, count_only, collectLimit, with_lines, with_cols } = workerData;
-  const regex = new RegExp(pattern, flags);
+  const hasGroup = group !== undefined && group !== null;
+  // 'd' flag exposes m.indices so we can locate the requested capture group.
+  const matchFlags = with_lines && hasGroup && !flags.includes('d') ? flags + 'd' : flags;
+  const regex = new RegExp(pattern, matchFlags);
   const isGlobal = flags.includes('g');
   const buildLineStarts = (s) => {
     const starts = [0];
@@ -113,11 +116,18 @@ try {
     const matches = [];
     let m;
     while ((m = regex.exec(content)) !== null && matches.length < collectLimit) {
-      const value = (group !== undefined && group !== null && m[group] !== undefined) ? m[group] : m[0];
+      let value, idx;
+      if (hasGroup && m[group] !== undefined) {
+        value = m[group];
+        idx = (m.indices && m.indices[group]) ? m.indices[group][0] : m.index;
+      } else {
+        value = m[0];
+        idx = m.index;
+      }
       if (with_lines) {
-        const li = lineOf(starts, m.index);
+        const li = lineOf(starts, idx);
         const entry = { line: li + 1, match: value };
-        if (with_cols) entry.col = m.index - starts[li] + 1;
+        if (with_cols) entry.col = idx - starts[li] + 1;
         matches.push(entry);
       } else {
         matches.push(value);
@@ -165,8 +175,15 @@ function lineOf(starts, idx) { // largest starts[k] <= idx -> line k+1
   return ans;
 }
 
+const hasGroup = group !== undefined && group !== null;
+// The 'd' flag makes m.indices available so we can report the LOCATION of the
+// requested capture group, not just the whole match. Only needed when locating
+// a specific group; skipped otherwise to avoid the indices-tracking overhead.
+const wantGroupPos = with_lines && hasGroup;
+const matchFlags = wantGroupPos && !flags.includes('d') ? flags + 'd' : flags;
+
 function scanOne(content) {
-  const regex = new RegExp(pattern, flags);
+  const regex = new RegExp(pattern, matchFlags);
   if (count_only) {
     let count = 0, m;
     while ((m = regex.exec(content)) !== null) {
@@ -181,11 +198,20 @@ function scanOne(content) {
   const matches = [];
   let m;
   while ((m = regex.exec(content)) !== null && matches.length < collectLimit) {
-    const value = (group !== undefined && group !== null && m[group] !== undefined) ? m[group] : m[0];
+    let value, idx;
+    if (hasGroup && m[group] !== undefined) {
+      value = m[group];
+      // m.indices[group] is the group's own [start,end]; undefined if the group
+      // didn't participate, in which case value already fell back to m[0].
+      idx = (m.indices && m.indices[group]) ? m.indices[group][0] : m.index;
+    } else {
+      value = m[0];
+      idx = m.index;
+    }
     if (with_lines) {
-      const li = lineOf(starts, m.index);
+      const li = lineOf(starts, idx);
       const entry = { line: li + 1, match: value };
-      if (with_cols) entry.col = m.index - starts[li] + 1;
+      if (with_cols) entry.col = idx - starts[li] + 1;
       matches.push(entry);
     } else {
       matches.push(value);
@@ -1057,7 +1083,8 @@ server.registerTool(
       .default(false)
       .describe(
         "Prefix each match with its 1-based line number as {line, match} (like grep -n). " +
-          "Ignored when count_only or unique is set."
+          "When `group` is set, the line (and column) point at that capture group's " +
+          "position, not the whole match. Ignored when count_only or unique is set."
       ),
     with_cols: z
       .boolean()
