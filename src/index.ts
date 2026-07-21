@@ -83,9 +83,22 @@ function textResult(payload: string) {
 const REGEX_WORKER = `
 const { parentPort, workerData } = require('worker_threads');
 try {
-  const { content, pattern, flags, group, count_only, collectLimit } = workerData;
+  const { content, pattern, flags, group, count_only, collectLimit, with_lines, with_cols } = workerData;
   const regex = new RegExp(pattern, flags);
   const isGlobal = flags.includes('g');
+  const buildLineStarts = (s) => {
+    const starts = [0];
+    for (let i = 0; i < s.length; i++) if (s[i] === '\\n') starts.push(i + 1);
+    return starts;
+  };
+  const lineOf = (starts, idx) => {
+    let lo = 0, hi = starts.length - 1, ans = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (starts[mid] <= idx) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    return ans;
+  };
   if (count_only) {
     let count = 0, m;
     while ((m = regex.exec(content)) !== null) {
@@ -96,11 +109,19 @@ try {
     }
     parentPort.postMessage({ result: { count } });
   } else {
+    const starts = with_lines ? buildLineStarts(content) : null;
     const matches = [];
     let m;
     while ((m = regex.exec(content)) !== null && matches.length < collectLimit) {
-      if (group !== undefined && group !== null && m[group] !== undefined) matches.push(m[group]);
-      else matches.push(m[0]);
+      const value = (group !== undefined && group !== null && m[group] !== undefined) ? m[group] : m[0];
+      if (with_lines) {
+        const li = lineOf(starts, m.index);
+        const entry = { line: li + 1, match: value };
+        if (with_cols) entry.col = m.index - starts[li] + 1;
+        matches.push(entry);
+      } else {
+        matches.push(value);
+      }
       if (m[0] === '' && isGlobal) regex.lastIndex++;
       if (!isGlobal) break;
     }
@@ -124,9 +145,25 @@ const SCAN_WORKER = `
 const { parentPort, workerData } = require('worker_threads');
 const { readFileSync, statSync } = require('fs');
 const {
-  files, sizes, pattern, flags, group, count_only, collectLimit, maxInputBytes
+  files, sizes, pattern, flags, group, count_only, collectLimit, maxInputBytes,
+  with_lines, with_cols
 } = workerData;
 const isGlobal = flags.includes('g');
+
+function buildLineStarts(content) {
+  const starts = [0];
+  for (let i = 0; i < content.length; i++)
+    if (content[i] === '\\n') starts.push(i + 1);
+  return starts;
+}
+function lineOf(starts, idx) { // largest starts[k] <= idx -> line k+1
+  let lo = 0, hi = starts.length - 1, ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (starts[mid] <= idx) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return ans;
+}
 
 function scanOne(content) {
   const regex = new RegExp(pattern, flags);
@@ -140,11 +177,19 @@ function scanOne(content) {
     }
     return { count: count };
   }
+  const starts = with_lines ? buildLineStarts(content) : null;
   const matches = [];
   let m;
   while ((m = regex.exec(content)) !== null && matches.length < collectLimit) {
-    if (group !== undefined && group !== null && m[group] !== undefined) matches.push(m[group]);
-    else matches.push(m[0]);
+    const value = (group !== undefined && group !== null && m[group] !== undefined) ? m[group] : m[0];
+    if (with_lines) {
+      const li = lineOf(starts, m.index);
+      const entry = { line: li + 1, match: value };
+      if (with_cols) entry.col = m.index - starts[li] + 1;
+      matches.push(entry);
+    } else {
+      matches.push(value);
+    }
     if (m[0] === '' && isGlobal) regex.lastIndex++;
     if (!isGlobal) break;
   }
@@ -236,7 +281,13 @@ interface RegexOpts {
   limit: number;
   count_only: boolean;
   unique: boolean;
+  with_lines: boolean;
+  with_cols: boolean;
 }
+
+/** A located match when with_lines is set: the text plus its 1-based line (and
+ *  1-based column when with_cols is set). */
+type LocatedMatch = { line: number; col?: number; match: string };
 
 interface BatchOutcome {
   entries: Array<{ i: number; entry: { result?: RawScan; error?: string } }>;
@@ -248,7 +299,7 @@ interface BatchOutcome {
   reached: number;
 }
 
-type RawScan = { count?: number; matches?: string[] };
+type RawScan = { count?: number; matches?: Array<string | LocatedMatch> };
 
 /** Run one batch of files through a single scan worker.
  *
@@ -274,6 +325,8 @@ function scanBatch(
         count_only: opts.count_only,
         collectLimit: opts.unique ? 10_000 : opts.limit,
         maxInputBytes: MAX_INPUT_BYTES,
+        with_lines: opts.with_lines,
+        with_cols: opts.with_cols,
       },
     });
 
@@ -332,7 +385,10 @@ function finalizeScan(raw: RawScan, opts: RegexOpts): unknown {
   const matches = raw.matches ?? [];
   if (opts.unique) {
     const freq = new Map<string, number>();
-    for (const m of matches) freq.set(m, (freq.get(m) || 0) + 1);
+    for (const m of matches) {
+      const key = typeof m === "string" ? m : m.match;
+      freq.set(key, (freq.get(key) || 0) + 1);
+    }
     return [...freq.entries()]
       .map(([m, count]) => ({ match: m, count }))
       .sort((a, b) => b.count - a.count)
@@ -931,12 +987,12 @@ server.registerTool(
  *  file_path). One worker per call is fine here — it's one call. The multi-file
  *  path goes through scanFiles() instead, which must not pay this per file. */
 async function runRegex(content: string, opts: RegexOpts): Promise<unknown> {
-  const { pattern, flags, group, limit, count_only, unique } = opts;
+  const { pattern, flags, group, limit, count_only, unique, with_lines, with_cols } = opts;
   const collectLimit = unique ? 10_000 : limit;
 
   const out = await runInWorker<RawScan>(
     REGEX_WORKER,
-    { content, pattern, flags, group, count_only, collectLimit },
+    { content, pattern, flags, group, count_only, collectLimit, with_lines, with_cols },
     REGEX_TIMEOUT_MS
   );
 
@@ -954,7 +1010,8 @@ server.registerTool(
     "array — no need to enumerate files first. Multi-file mode returns per-file " +
     "results for the files that matched; files with no matches are omitted, and " +
     "`scanned` reports the total examined. `count_only` acts like grep -c, " +
-    "`unique` like sort | uniq -c.",
+    "`unique` like sort | uniq -c, and `with_lines` gives grep -n style " +
+    "{line, match} results (add `with_cols` for the 1-based column).",
   inputSchema: z.object({
     file_path: z.string().optional().describe("Absolute path to the file"),
     text: z
@@ -994,6 +1051,22 @@ server.registerTool(
       .describe(
         "Deduplicate matches and return [{match, count}] sorted by frequency (like sort | uniq -c)"
       ),
+    with_lines: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Prefix each match with its 1-based line number as {line, match} (like grep -n). " +
+          "Ignored when count_only or unique is set."
+      ),
+    with_cols: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Also include the 1-based column of the match start as {line, col, match} " +
+          "(like ripgrep --column). Requires with_lines."
+      ),
   }).strict(),
   },
   async ({
@@ -1008,8 +1081,19 @@ server.registerTool(
     limit,
     count_only,
     unique,
+    with_lines,
+    with_cols,
   }) => {
-    const opts: RegexOpts = { pattern, flags, group, limit, count_only, unique };
+    const opts: RegexOpts = {
+      pattern,
+      flags,
+      group,
+      limit,
+      count_only,
+      unique,
+      with_lines,
+      with_cols: with_lines && with_cols,
+    };
     const multi = (paths && paths.length) || glob;
 
     if (multi) {
