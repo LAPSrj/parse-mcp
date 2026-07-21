@@ -947,10 +947,14 @@ server.registerTool(
   "regex_extract",
   {
   description:
-    "Extract regex matches from a file, inline text, or many files at once " +
-    "(paths/glob). With a glob or paths array, returns per-file results for the " +
-    "files that matched — files with no matches are omitted; see `scanned` for " +
-    "the total examined.",
+    "Search files for a regex — the recursive grep/ripgrep replacement. Works on " +
+    "one file (file_path), inline text, or MANY files at once: pass a `glob` " +
+    "(e.g. '**/*.ts' recurses the whole tree; use {a,b} alternation like " +
+    "'{src,test}/**/*.ts' to span several directories) or an explicit `paths` " +
+    "array — no need to enumerate files first. Multi-file mode returns per-file " +
+    "results for the files that matched; files with no matches are omitted, and " +
+    "`scanned` reports the total examined. `count_only` acts like grep -c, " +
+    "`unique` like sort | uniq -c.",
   inputSchema: z.object({
     file_path: z.string().optional().describe("Absolute path to the file"),
     text: z
