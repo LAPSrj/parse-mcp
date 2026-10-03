@@ -854,6 +854,14 @@ async function resolvePaths(args: {
   return [];
 }
 
+/** JMESPath truthiness: null, false, "", [] and {} are false; 0 is true. */
+function jmesTruthy(v: unknown): boolean {
+  if (v === null || v === undefined || v === false || v === "") return false;
+  if (Array.isArray(v)) return v.length > 0;
+  if (typeof v === "object") return Object.keys(v as object).length > 0;
+  return true;
+}
+
 /** Iterate the parseable JSON records of NDJSON/JSONL content; bad lines skipped. */
 function* iterJsonl(content: string): Generator<unknown> {
   for (const line of content.split("\n")) {
@@ -1414,34 +1422,46 @@ server.registerTool(
     include_source,
     limit,
   }) => {
-    // Gather sources as [sourceLabel, content].
-    const sources: Array<[string, string]> = [];
-    if (text !== undefined && !file_path && !paths && !glob) {
-      sources.push(["<text>", text]);
-    } else {
-      const files = await resolvePaths({ file_path, paths, glob, cwd });
-      for (const f of files) {
-        try {
-          sources.push([f.display, await readFileCapped(f.path)]);
-        } catch {
-          /* unreadable file → skipped */
-        }
-      }
-    }
+    // Read and process one source at a time, so memory holds a single file
+    // rather than the whole glob (a multi-GB glob otherwise OOMs the server).
+    const files =
+      text !== undefined && !file_path && !paths && !glob
+        ? null
+        : await resolvePaths({ file_path, paths, glob, cwd });
+    const total = files ? files.length : 1;
+    const deadline = Date.now() + CALL_BUDGET_MS;
 
     const groups = new Map<string, number>();
     const records: unknown[] = [];
     let scanned = 0;
     let matched = 0;
+    let filesDone = 0;
+    let note: string | undefined;
 
-    for (const [label, content] of sources) {
+    outer: for (let i = 0; i < total; i++) {
+      if (Date.now() > deadline) {
+        note = `Call budget of ${CALL_BUDGET_MS}ms expired after reading ${filesDone} of ${total} files. Results are PARTIAL — narrow the glob and re-run.`;
+        break;
+      }
+      let label = "<text>";
+      let content = text as string;
+      if (files) {
+        label = files[i].display;
+        try {
+          content = await readFileCapped(files[i].path);
+        } catch {
+          filesDone++;
+          continue; /* unreadable file → skipped */
+        }
+      }
       for (let rec of iterJsonl(content)) {
         scanned++;
-        if (parse_nested) rec = deepParseJson(rec);
-        if (filter) {
-          const ok = jmespath.search(rec, filter);
-          if (!ok) continue;
+        if (scanned % 1000 === 0 && Date.now() > deadline) {
+          note = `Call budget of ${CALL_BUDGET_MS}ms expired while reading file ${filesDone + 1} of ${total}. Results are PARTIAL — narrow the glob and re-run.`;
+          break outer;
         }
+        if (parse_nested) rec = deepParseJson(rec);
+        if (filter && !jmesTruthy(jmespath.search(rec, filter))) continue;
         matched++;
         if (group_by) {
           const key = jmespath.search(rec, group_by);
@@ -1452,11 +1472,13 @@ server.registerTool(
               ? JSON.stringify(key)
               : String(key);
           groups.set(keyStr, (groups.get(keyStr) || 0) + 1);
-        } else if (records.length < limit) {
+        } else {
           const value = expression ? jmespath.search(rec, expression) : rec;
           records.push(include_source ? { source: label, value } : value);
+          if (records.length >= limit) break outer; // nothing more to collect
         }
       }
+      filesDone++;
     }
 
     if (group_by) {
@@ -1465,11 +1487,17 @@ server.registerTool(
         .sort((a, b) => b.count - a.count)
         .slice(0, limit);
       return textResult(
-        JSON.stringify({ scanned, matched, groups: sorted }, null, 2)
+        JSON.stringify(
+          { scanned, matched, ...(note ? { note } : {}), groups: sorted },
+          null,
+          2
+        )
       );
     }
 
-    return textResult(JSON.stringify(records, null, 2));
+    const result = textResult(JSON.stringify(records, null, 2));
+    if (note) result.content.push({ type: "text" as const, text: note });
+    return result;
   }
 );
 
@@ -1634,32 +1662,42 @@ server.registerTool(
     agg_field,
     limit,
   }) => {
-    // Gather records across sources.
-    const all: Array<Record<string, string>> = [];
-    if (text !== undefined && !file_path && !paths && !glob) {
-      all.push(...rowsToObjects(parseDelimited(text, delimiter), header));
-    } else {
-      const files = await resolvePaths({ file_path, paths, glob, cwd });
-      for (const f of files) {
-        try {
-          all.push(
-            ...rowsToObjects(
-              parseDelimited(await readFileCapped(f.path), delimiter),
-              header
-            )
-          );
-        } catch {
-          /* unreadable file → skipped */
-        }
+    // Read and filter one source at a time, keeping only the rows the result
+    // needs, so a large glob can't hold every row of every file in memory.
+    const files =
+      text !== undefined && !file_path && !paths && !glob
+        ? null
+        : await resolvePaths({ file_path, paths, glob, cwd });
+    const total = files ? files.length : 1;
+    const deadline = Date.now() + CALL_BUDGET_MS;
+    const counts = new Map<string, number>();
+    const nums = new Map<string, number[]>();
+    const kept: Array<Record<string, string>> = [];
+    let scanned = 0;
+    let matched = 0;
+    let note: string | undefined;
+
+    for (let i = 0; i < total; i++) {
+      if (!group_by && kept.length >= limit) break; // nothing more to collect
+      if (Date.now() > deadline) {
+        note = `Call budget of ${CALL_BUDGET_MS}ms expired after reading ${i} of ${total} files. Results are PARTIAL — narrow the glob and re-run.`;
+        break;
       }
-    }
-
-    const kept = filter ? all.filter((r) => jmespath.search(r, filter)) : all;
-
-    if (group_by) {
-      const counts = new Map<string, number>();
-      const nums = new Map<string, number[]>();
-      for (const r of kept) {
+      let rows: Array<Record<string, string>>;
+      try {
+        const content = files ? await readFileCapped(files[i].path) : (text as string);
+        rows = rowsToObjects(parseDelimited(content, delimiter), header);
+      } catch {
+        continue; /* unreadable file → skipped */
+      }
+      scanned += rows.length;
+      for (const r of rows) {
+        if (filter && !jmesTruthy(jmespath.search(r, filter))) continue;
+        matched++;
+        if (!group_by) {
+          if (kept.length < limit) kept.push(r);
+          continue;
+        }
         const key = jmespath.search(r, group_by);
         const keyStr =
           key === null || key === undefined
@@ -1676,6 +1714,9 @@ server.registerTool(
           }
         }
       }
+    }
+
+    if (group_by) {
       const groups = [...counts.entries()]
         .map(([key, count]) => {
           const out: Record<string, unknown> = { key, count };
@@ -1687,11 +1728,11 @@ server.registerTool(
         .sort((a, b) => (b.count as number) - (a.count as number))
         .slice(0, limit);
       return textResult(
-        JSON.stringify({ scanned: all.length, matched: kept.length, groups }, null, 2)
+        JSON.stringify({ scanned, matched, ...(note ? { note } : {}), groups }, null, 2)
       );
     }
 
-    const projected = kept.slice(0, limit).map((r) => {
+    const projected = kept.map((r) => {
       if (expression) return jmespath.search(r, expression);
       if (columns && columns.length) {
         const o: Record<string, string> = {};
@@ -1701,7 +1742,9 @@ server.registerTool(
       return r;
     });
 
-    return textResult(JSON.stringify(projected, null, 2));
+    const result = textResult(JSON.stringify(projected, null, 2));
+    if (note) result.content.push({ type: "text" as const, text: note });
+    return result;
   }
 );
 
