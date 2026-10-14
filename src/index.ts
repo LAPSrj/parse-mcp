@@ -514,6 +514,31 @@ async function scanFiles(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Move leading PCRE/Python-style inline flags — (?i), (?s), (?m), or combos
+ *  like (?is) — into the JS flags string. JS has no global inline-flag syntax,
+ *  so `new RegExp("(?i)foo")` throws "Invalid group". */
+function normalizeRegex(
+  pattern: string,
+  flags: string
+): { pattern: string; flags: string } {
+  let p = pattern;
+  let f = flags;
+  let m;
+  while ((m = /^\(\?([a-zA-Z]+)\)/.exec(p))) {
+    for (const c of m[1]) {
+      if (!"ims".includes(c)) {
+        throw new Error(
+          `Inline flag (?${c}) has no JavaScript equivalent. Supported inline ` +
+            `flags are i, m, s; or pass them in \`flags\` instead.`
+        );
+      }
+      if (!f.includes(c)) f += c;
+    }
+    p = p.slice(m[0].length);
+  }
+  return { pattern: p, flags: f };
+}
+
 async function resolveContent(
   filePath?: string,
   text?: string
@@ -561,7 +586,8 @@ function deepReplace(
     let result = data;
     for (const { from, to, regex } of replacements) {
       if (regex) {
-        result = result.replace(new RegExp(from, "g"), to);
+        const re = normalizeRegex(from, "g");
+        result = result.replace(new RegExp(re.pattern, re.flags), to);
       } else {
         result = result.split(from).join(to);
       }
@@ -1066,7 +1092,11 @@ server.registerTool(
       .string()
       .optional()
       .describe("Base directory for a relative glob (default: process cwd)"),
-    pattern: z.string().describe("Regular expression pattern"),
+    pattern: z
+      .string()
+      .describe(
+        "JavaScript regular expression. A leading inline flag group like (?i) or (?s) is moved into flags."
+      ),
     flags: z.string().optional().default("g").describe("Regex flags (default: 'g')"),
     group: z
       .number()
@@ -1120,8 +1150,7 @@ server.registerTool(
     with_cols,
   }) => {
     const opts: RegexOpts = {
-      pattern,
-      flags,
+      ...normalizeRegex(pattern, flags),
       group,
       limit,
       count_only,
@@ -1791,10 +1820,11 @@ server.registerTool(
       if (regex) {
         // Run the (user-supplied) regex in a worker with a timeout so a
         // catastrophic pattern is killed instead of hanging the server.
-        const f = flags.includes("g") ? flags : flags + "g";
+        const re = normalizeRegex(from, flags);
+        const f = re.flags.includes("g") ? re.flags : re.flags + "g";
         const out = await runInWorker<{ result: string; count: number }>(
           REPLACE_WORKER,
-          { text: result, from, to, flags: f },
+          { text: result, from: re.pattern, to, flags: f },
           REGEX_TIMEOUT_MS
         );
         total += out.count;

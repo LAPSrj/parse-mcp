@@ -175,7 +175,7 @@ With a single `file_path`/`text`, returns the matches directly. With a glob or p
 | `paths` | string[]? | | Multiple file paths to scan; returns one result per matching file |
 | `glob` | string? | | Glob (e.g. `**/*.ts`) to scan many files; returns one result per matching file |
 | `cwd` | string? | | Base directory for a relative glob |
-| `pattern` | string | | Regular expression pattern |
+| `pattern` | string | | JavaScript regular expression. A leading inline flag group (`(?i)`, `(?s)`, `(?m)`, or a combination like `(?is)`) is moved into `flags`; `text_replace` and `json_transform` regex replacements accept the same syntax |
 | `flags` | string? | `"g"` | Regex flags |
 | `group` | number? | | Capture group index to return (0 = full match) |
 | `limit` | number? | `50` | Max matches to return |
