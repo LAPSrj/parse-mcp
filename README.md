@@ -179,8 +179,8 @@ With a single `file_path`/`text`, returns the matches directly. With a glob or p
 | `flags` | string? | `"g"` | Regex flags |
 | `group` | number? | | Capture group index to return (0 = full match) |
 | `limit` | number? | `50` | Max matches to return |
-| `count_only` | boolean? | `false` | Return `{count}` instead of matches (like `grep -c`) |
-| `unique` | boolean? | `false` | Deduplicate matches, return `[{match, count}]` sorted by frequency (like `sort \| uniq -c`) |
+| `count_only` | boolean? | `false` | Return `{count}` instead of matches (like `grep -c`). With `glob`/`paths`, the response also has `total` across all files |
+| `unique` | boolean? | `false` | Deduplicate matches, return `[{match, count}]` sorted by frequency (like `sort \| uniq -c`). With `glob`/`paths`, returns one list across all files, `{scanned, matched, distinct, results: [{match, count, files}]}`, where `files` is how many files contain the match |
 
 ### html_select
 

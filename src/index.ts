@@ -1107,13 +1107,18 @@ server.registerTool(
       .boolean()
       .optional()
       .default(false)
-      .describe("Return only the match count (like grep -c) instead of the matches"),
+      .describe(
+        "Return only the match count (like grep -c) instead of the matches. " +
+          "With glob/paths, also returns `total` across all files."
+      ),
     unique: z
       .boolean()
       .optional()
       .default(false)
       .describe(
-        "Deduplicate matches and return [{match, count}] sorted by frequency (like sort | uniq -c)"
+        "Deduplicate matches and return [{match, count}] sorted by frequency (like sort | uniq -c). " +
+          "With glob/paths, returns ONE list across all files as {match, count, files}, " +
+          "where files is how many files contain the match."
       ),
     with_lines: z
       .boolean()
@@ -1162,12 +1167,57 @@ server.registerTool(
 
     if (multi) {
       const files = await resolvePaths({ file_path, paths, glob, cwd });
+      if (opts.unique) {
+        // One frequency list across every file (like grep -rho | sort | uniq -c),
+        // so collect each file's raw matches and merge them here.
+        const raw = { ...opts, unique: false, limit: 10_000, with_lines: false, with_cols: false };
+        const { results, scanned, note } = await scanFiles(files, raw);
+        const freq = new Map<string, { count: number; files: number }>();
+        const errors: Array<{ file: string; error: string }> = [];
+        for (const r of results) {
+          if (r.error) {
+            errors.push({ file: r.file, error: r.error });
+            continue;
+          }
+          const seen = new Set<string>();
+          for (const m of r.result as string[]) {
+            const f = freq.get(m) ?? { count: 0, files: 0 };
+            f.count++;
+            if (!seen.has(m)) {
+              f.files++;
+              seen.add(m);
+            }
+            freq.set(m, f);
+          }
+        }
+        const unique = [...freq.entries()]
+          .map(([match, f]) => ({ match, count: f.count, files: f.files }))
+          .sort((a, b) => b.count - a.count);
+        return textResult(
+          JSON.stringify(
+            {
+              scanned,
+              matched: results.length - errors.length,
+              distinct: unique.length,
+              ...(note ? { note } : {}),
+              ...(errors.length ? { errors } : {}),
+              results: unique.slice(0, opts.limit),
+            },
+            null,
+            2
+          )
+        );
+      }
       const { results, scanned, note } = await scanFiles(files, opts);
+      const total = opts.count_only
+        ? results.reduce((n, r) => n + ((r.result as { count?: number })?.count ?? 0), 0)
+        : undefined;
       return textResult(
         JSON.stringify(
           {
             scanned,
             matched: results.length,
+            ...(total !== undefined ? { total } : {}),
             ...(note ? { note } : {}),
             results,
           },
