@@ -8,12 +8,15 @@ Agents often guess parameter names from other tools, so the server renames the c
 
 ### json_query
 
-Query JSON data using a [JMESPath](https://jmespath.org/) expression.
+Query JSON data using a [JMESPath](https://jmespath.org/) expression. With `paths` or `glob`, returns `{scanned, matched, results}`, where `results` holds one `{file, result}` per file whose result isn't null (or `{file, error}` for a file that doesn't parse).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `file_path` | string? | | Absolute path to a JSON file |
 | `text` | string? | | Inline JSON string (alternative to file_path) |
+| `paths` | string[]? | | Multiple JSON files to query; returns one result per file |
+| `glob` | string? | | Glob (e.g. `**/*.json`) to query many files; returns one result per file |
+| `cwd` | string? | | Base directory for a relative glob |
 | `expression` | string | | JMESPath expression to evaluate |
 | `parse_nested` | boolean? | `false` | Recursively parse string values that contain JSON |
 | `limit` | number? | `50` | Max array items to return |

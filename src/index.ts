@@ -1227,8 +1227,11 @@ server.registerTool(
   "json_query",
   {
   description:
-    "Query JSON data using a JMESPath expression. Can read from a file or inline text. " +
-    "Use parse_nested to automatically parse JSON strings embedded inside values.",
+    "Query JSON data using a JMESPath expression. Can read from a file, inline " +
+    "text, or many files at once (`paths` or `glob`), which returns " +
+    "{scanned, matched, results: [{file, result}]} for files with a non-null " +
+    "result. Use parse_nested to automatically parse JSON strings embedded " +
+    "inside values. For JSONL (one object per line) use jsonl_query.",
   inputSchema: toolSchema("json_query", {
     file_path: z
       .string()
@@ -1238,6 +1241,18 @@ server.registerTool(
       .string()
       .optional()
       .describe("Inline JSON string (alternative to file_path)"),
+    paths: z
+      .array(z.string())
+      .optional()
+      .describe("Multiple JSON files to query; returns one result per file"),
+    glob: z
+      .string()
+      .optional()
+      .describe("Glob (e.g. '**/*.json') to query many files; returns one result per file"),
+    cwd: z
+      .string()
+      .optional()
+      .describe("Base directory for a relative glob (default: process cwd)"),
     expression: z.string().describe("JMESPath expression to evaluate"),
     parse_nested: z
       .boolean()
@@ -1260,22 +1275,58 @@ server.registerTool(
       ),
   }),
   },
-  async ({ file_path, text, expression, parse_nested, limit, max_string_length }) => {
-    const raw = await resolveContent(file_path, text);
-    let data: unknown = JSON.parse(raw);
+  async ({
+    file_path,
+    text,
+    paths,
+    glob,
+    cwd,
+    expression,
+    parse_nested,
+    limit,
+    max_string_length,
+  }) => {
+    const query = (raw: string) => {
+      let data: unknown = JSON.parse(raw);
+      if (parse_nested) data = deepParseJson(data);
+      let result = jmespath.search(data, expression);
+      if (Array.isArray(result) && result.length > limit) {
+        result = result.slice(0, limit);
+      }
+      if (max_string_length) result = truncateStrings(result, max_string_length);
+      return result;
+    };
 
-    if (parse_nested) {
-      data = deepParseJson(data);
+    if ((paths && paths.length) || glob) {
+      // One file at a time, so memory holds a single parsed document.
+      const files = await resolvePaths({ paths, glob, cwd });
+      const deadline = Date.now() + CALL_BUDGET_MS;
+      const results: Array<{ file: string; result?: unknown; error?: string }> = [];
+      let scanned = 0;
+      let note: string | undefined;
+      for (const f of files) {
+        if (Date.now() > deadline) {
+          note = `Call budget of ${CALL_BUDGET_MS}ms expired after reading ${scanned} of ${files.length} files. Results are PARTIAL — narrow the glob and re-run.`;
+          break;
+        }
+        scanned++;
+        try {
+          const result = query(await readFileCapped(f.path));
+          if (result !== null) results.push({ file: f.display, result });
+        } catch (e) {
+          results.push({ file: f.display, error: (e as Error).message });
+        }
+      }
+      return textResult(
+        JSON.stringify(
+          { scanned, matched: results.length, ...(note ? { note } : {}), results },
+          null,
+          2
+        )
+      );
     }
 
-    let result = jmespath.search(data, expression);
-
-    if (Array.isArray(result) && result.length > limit) {
-      result = result.slice(0, limit);
-    }
-    if (max_string_length) result = truncateStrings(result, max_string_length);
-
-    return textResult(JSON.stringify(result, null, 2));
+    return textResult(JSON.stringify(query(await resolveContent(file_path, text)), null, 2));
   }
 );
 
