@@ -4,6 +4,8 @@ MCP server with scoped, read-only parsing tools (JSON, JSONL, CSV/TSV, regex, HT
 
 ## Tools
 
+Agents often guess parameter names from other tools, so the server renames the common guesses before validating a call: `path`/`file`/`filepath`/`filename` → `file_path`, `query`/`expr`/`jmespath` → `expression`, `max_matches`/`max_results`/`max_count`/`max_items`/`head_limit` → `limit`, `dir`/`directory` → `cwd` (or file_list's `path`), `pattern` → `glob` and `cwd` → `path` on file_list, `regex` → `pattern` on regex_extract, `ignore_case`/`case_insensitive: true` → the `i` flag, a top-level `find`/`replace` pair → text_replace's `replacements`, and a one-element `paths` → `file_path` on single-file tools. A rename applies only when the tool doesn't have a parameter of that name. Any other unknown parameter fails with an error that lists the tool's valid parameters.
+
 ### json_query
 
 Query JSON data using a [JMESPath](https://jmespath.org/) expression.
@@ -227,8 +229,8 @@ List files matching a glob, with optional mtime / size / type filters and sortin
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `glob` | string | | Glob pattern. Absolute (e.g. `/var/log/**/*.log`) or relative to `cwd` |
-| `cwd` | string? | | Base directory for a relative glob |
+| `glob` | string? | `"*"` | Glob pattern. Absolute (e.g. `/var/log/**/*.log`) or relative to `path`. The default lists the top level of `path`, like `ls` |
+| `path` | string? | | Base directory for a relative glob (default: process cwd) |
 | `since` | string? | | Only files modified at/after this time. Relative duration (`2d`, `30m`, `1w`), epoch ms, or ISO date |
 | `until` | string? | | Only files modified at/before this time (same formats) |
 | `min_size` | number? | | Minimum size in bytes |

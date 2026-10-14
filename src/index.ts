@@ -49,6 +49,12 @@ const MAX_DEPTH = 2000;
  *  error (which the SDK returns to the client instead of risking an OOM). */
 async function readFileCapped(p: string): Promise<string> {
   const st = await stat(p);
+  if (st.isDirectory()) {
+    throw new Error(
+      `${p} is a directory. To read the files in it, pass glob (e.g. '**/*') ` +
+        `with cwd: '${p}' where the tool supports it, or list them with file_list.`
+    );
+  }
   if (st.size > MAX_INPUT_BYTES) {
     throw new Error(
       `File too large: ${st.size} bytes (max ${MAX_INPUT_BYTES}). ` +
@@ -1079,6 +1085,141 @@ function finalizeGroups(
 }
 
 // ---------------------------------------------------------------------------
+// Argument names
+//
+// Agents guess parameter names from other tools (`query` for expression,
+// `path` for file_path, `max_matches` for limit), and a strict schema rejects
+// the call. normalizeArgs() renames the common guesses before validation; any
+// name it doesn't know fails with an error that lists the valid parameters.
+// ---------------------------------------------------------------------------
+
+/** Parameter names per tool, filled in by toolSchema(). */
+const TOOL_KEYS = new Map<string, Set<string>>();
+
+/** Guessed name → the parameter(s) it may mean, in order of preference. A
+ *  rename applies only when the tool has the target and lacks the guessed name,
+ *  so `path` stays file_list's base directory but means file_path elsewhere. */
+const ALIASES: Record<string, string[]> = {
+  path: ["file_path"],
+  file: ["file_path"],
+  filepath: ["file_path"],
+  filename: ["file_path"],
+  file_name: ["file_path"],
+  query: ["expression"],
+  expr: ["expression"],
+  jmespath: ["expression"],
+  max_matches: ["limit"],
+  max_results: ["limit"],
+  max_count: ["limit"],
+  max_items: ["limit"],
+  head_limit: ["limit"],
+  dir: ["cwd", "path"],
+  directory: ["cwd", "path"],
+  cwd: ["path"],
+  pattern: ["glob"],
+  regex: ["pattern"],
+};
+
+/** Extra advice for a parameter a tool doesn't have. */
+const HINTS: Record<string, Record<string, string>> = {
+  text_replace: {
+    paths: "text_replace edits one file per call: pass file_path and call it once per file.",
+    glob: "text_replace edits one file per call: list the files with file_list, then call it once per file.",
+  },
+  json_transform: {
+    paths: "json_transform edits one file per call: pass file_path and call it once per file.",
+  },
+  html_select: { paths: "html_select reads one file per call: pass file_path." },
+  text_count: { paths: "text_count reads one file per call: pass file_path." },
+};
+
+/** A strict tool input schema whose unknown-parameter error names the valid
+ *  parameters, so an agent can correct the call in one retry. */
+function toolSchema<T extends z.ZodRawShape>(tool: string, shape: T) {
+  const keys = Object.keys(shape);
+  TOOL_KEYS.set(tool, new Set(keys));
+  return z
+    .object(shape, {
+      errorMap: (issue, ctx) => {
+        if (issue.code !== "unrecognized_keys") return { message: ctx.defaultError };
+        const hints = issue.keys
+          .map((k) => HINTS[tool]?.[k])
+          .filter(Boolean)
+          .join(" ");
+        return {
+          message:
+            `Unknown parameter(s) for ${tool}: ${issue.keys.join(", ")}. ` +
+            (hints ? hints + " " : "") +
+            `Valid parameters: ${keys.join(", ")}.`,
+        };
+      },
+    })
+    .strict();
+}
+
+/** Rename guessed parameter names to the tool's own (mutates args). */
+function normalizeArgs(tool: string, args: Record<string, unknown>): void {
+  const keys = TOOL_KEYS.get(tool);
+  if (!keys) return;
+
+  // text_replace: a top-level find/replace pair (sed- or editor-style) becomes
+  // the single entry of `replacements`.
+  if (tool === "text_replace" && args.replacements === undefined) {
+    const pick = (names: string[]) => {
+      const k = names.find((n) => args[n] !== undefined);
+      if (!k) return undefined;
+      const v = args[k];
+      delete args[k];
+      return v;
+    };
+    const from = pick(["find", "search", "from", "old", "old_string"]);
+    const to = pick(["replace", "replacement", "to", "new", "new_string"]);
+    if (from !== undefined && to !== undefined) {
+      const entry: Record<string, unknown> = { from, to };
+      for (const k of ["regex", "flags"]) {
+        if (args[k] !== undefined) {
+          entry[k] = args[k];
+          delete args[k];
+        }
+      }
+      args.replacements = [entry];
+    }
+  }
+
+  // A one-element `paths` on a single-file tool is that file.
+  if (
+    !keys.has("paths") &&
+    keys.has("file_path") &&
+    args.file_path === undefined &&
+    Array.isArray(args.paths) &&
+    args.paths.length === 1
+  ) {
+    args.file_path = args.paths[0];
+    delete args.paths;
+  }
+
+  // regex_extract: boolean case-insensitivity → the i flag.
+  if (tool === "regex_extract") {
+    for (const k of ["ignore_case", "case_insensitive"]) {
+      if (args[k] === undefined) continue;
+      if (args[k] === true) {
+        const f = typeof args.flags === "string" ? args.flags : "g";
+        if (!f.includes("i")) args.flags = f + "i";
+      }
+      delete args[k];
+    }
+  }
+
+  for (const [alias, targets] of Object.entries(ALIASES)) {
+    if (args[alias] === undefined || keys.has(alias)) continue;
+    const target = targets.find((t) => keys.has(t));
+    if (!target || args[target] !== undefined) continue;
+    args[target] = args[alias];
+    delete args[alias];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
@@ -1088,7 +1229,7 @@ server.registerTool(
   description:
     "Query JSON data using a JMESPath expression. Can read from a file or inline text. " +
     "Use parse_nested to automatically parse JSON strings embedded inside values.",
-  inputSchema: z.object({
+  inputSchema: toolSchema("json_query", {
     file_path: z
       .string()
       .optional()
@@ -1117,7 +1258,7 @@ server.registerTool(
         "Cut every string in the result to this many characters, followed by " +
           "…[+N chars] (JMESPath has no substring function)"
       ),
-  }).strict(),
+  }),
   },
   async ({ file_path, text, expression, parse_nested, limit, max_string_length }) => {
     const raw = await resolveContent(file_path, text);
@@ -1167,7 +1308,7 @@ server.registerTool(
     "`scanned` reports the total examined. `count_only` acts like grep -c, " +
     "`unique` like sort | uniq -c, and `with_lines` gives grep -n style " +
     "{line, match} results (add `with_cols` for the 1-based column).",
-  inputSchema: z.object({
+  inputSchema: toolSchema("regex_extract", {
     file_path: z.string().optional().describe("Absolute path to the file"),
     text: z
       .string()
@@ -1232,7 +1373,7 @@ server.registerTool(
         "Also include the 1-based column of the match start as {line, col, match} " +
           "(like ripgrep --column). Requires with_lines."
       ),
-  }).strict(),
+  }),
   },
   async ({
     file_path,
@@ -1331,7 +1472,7 @@ server.registerTool(
   "html_select",
   {
   description: "Extract elements from HTML using CSS selectors.",
-  inputSchema: z.object({
+  inputSchema: toolSchema("html_select", {
     file_path: z
       .string()
       .optional()
@@ -1355,7 +1496,7 @@ server.registerTool(
       .optional()
       .default(50)
       .describe("Max elements to return"),
-  }).strict(),
+  }),
   },
   async ({ file_path, text, selector, attribute, output, limit }) => {
     const raw = await resolveContent(file_path, text);
@@ -1386,7 +1527,7 @@ server.registerTool(
     "Transform JSON data: apply string replacements across all values, set or delete fields " +
     "by path, and optionally write the result to a file. Designed for content migration " +
     "(URL rewrites, ID swaps) and bulk JSON manipulation without ad-hoc scripts.",
-  inputSchema: z.object({
+  inputSchema: toolSchema("json_transform", {
     file_path: z
       .string()
       .optional()
@@ -1436,7 +1577,7 @@ server.registerTool(
       .string()
       .optional()
       .describe("If provided, write the result to this file and return a confirmation instead of the full JSON"),
-  }).strict(),
+  }),
   },
   async ({
     file_path,
@@ -1489,7 +1630,7 @@ server.registerTool(
   {
   description:
     "Count lines, words, characters, and bytes in a file or inline text (like wc).",
-  inputSchema: z.object({
+  inputSchema: toolSchema("text_count", {
     file_path: z
       .string()
       .optional()
@@ -1498,7 +1639,7 @@ server.registerTool(
       .string()
       .optional()
       .describe("Inline text (alternative to file_path)"),
-  }).strict(),
+  }),
   },
   async ({ file_path, text }) => {
     const content = await resolveContent(file_path, text);
@@ -1527,7 +1668,7 @@ server.registerTool(
     "optional filtering, group-by aggregation, and multi-file fan-out. " +
     "Unparseable lines are skipped. This is what json_query cannot do: it parses " +
     "a single document, JSONL is many.",
-  inputSchema: z.object({
+  inputSchema: toolSchema("jsonl_query", {
     file_path: z.string().optional().describe("Absolute path to a .jsonl file"),
     text: z
       .string()
@@ -1606,7 +1747,7 @@ server.registerTool(
           "…[+N chars]. Use it for a compact per-record view of long text fields " +
           "(JMESPath has no substring function)"
       ),
-  }).strict(),
+  }),
   },
   async ({
     file_path,
@@ -1705,12 +1846,15 @@ server.registerTool(
     "List files matching a glob, with optional mtime / size / type filters and " +
     "sorting — a structured replacement for `find`/`ls`. The natural front half " +
     "of a parse workflow: list the files, then query their contents.",
-  inputSchema: z.object({
+  inputSchema: toolSchema("file_list", {
     glob: z
       .string()
+      .optional()
+      .default("*")
       .describe(
         "Glob pattern. Absolute (e.g. '/var/log/**/*.log') or relative to path " +
-          "(e.g. '**/*.ts'). Supports **, *, ?, and {a,b} alternation."
+          "(e.g. '**/*.ts'). Supports **, *, ?, and {a,b} alternation. Default " +
+          "'*' lists the top level of path, like ls."
       ),
     path: z
       .string()
@@ -1752,7 +1896,7 @@ server.registerTool(
       .default(false)
       .describe("Sort descending"),
     limit: z.number().optional().default(1000).describe("Max entries to return"),
-  }).strict(),
+  }),
   },
   async ({ glob, path: cwd, since, until, min_size, max_size, type, stat: withStat, sort, desc, limit }) => {
     const entries = await globFiles(glob, {
@@ -1796,7 +1940,7 @@ server.registerTool(
     "becomes a record object addressable by header name (or c0,c1,… when header " +
     "is false), so filter/expression/group_by all take JMESPath. Replaces " +
     "awk/cut for column work; supports multi-file paths/glob.",
-  inputSchema: z.object({
+  inputSchema: toolSchema("csv_query", {
     file_path: z.string().optional().describe("Absolute path to a delimited file"),
     text: z.string().optional().describe("Inline delimited text (alternative to file_path)"),
     paths: z
@@ -1841,7 +1985,7 @@ server.registerTool(
       .optional()
       .describe("Column to aggregate numerically when agg is sum/avg/min/max"),
     limit: z.number().optional().default(100).describe("Max rows or groups to return"),
-  }).strict(),
+  }),
   },
   async ({
     file_path,
@@ -1941,7 +2085,7 @@ server.registerTool(
     "with optional write-to-file. The plain-text counterpart to json_transform " +
     "(which only operates on JSON trees); replaces `sed s/.../.../`. Regex " +
     "replacements support capture-group references ($1, $2) in the replacement.",
-  inputSchema: z.object({
+  inputSchema: toolSchema("text_replace", {
     file_path: z.string().optional().describe("Absolute path to the file"),
     text: z.string().optional().describe("Inline text (alternative to file_path)"),
     replacements: z
@@ -1967,7 +2111,7 @@ server.registerTool(
       .string()
       .optional()
       .describe("If provided, write the result here and return a summary instead of the text"),
-  }).strict(),
+  }),
   },
   async ({ file_path, text, replacements, output_file }) => {
     let result = await resolveContent(file_path, text);
@@ -2029,6 +2173,14 @@ process.on("unhandledRejection", (reason) => {
 
 async function main() {
   const transport = new StdioServerTransport();
+  // connect() chains any onmessage already set and runs it first, so this
+  // renames guessed argument names before the SDK validates them.
+  transport.onmessage = (msg: any) => {
+    const p = msg?.method === "tools/call" ? msg.params : undefined;
+    if (p && typeof p.name === "string" && p.arguments && typeof p.arguments === "object") {
+      normalizeArgs(p.name, p.arguments);
+    }
+  };
   await server.connect(transport);
 }
 
