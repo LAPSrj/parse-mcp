@@ -15,6 +15,7 @@ Query JSON data using a [JMESPath](https://jmespath.org/) expression.
 | `expression` | string | | JMESPath expression to evaluate |
 | `parse_nested` | boolean? | `false` | Recursively parse string values that contain JSON |
 | `limit` | number? | `50` | Max array items to return |
+| `max_string_length` | number? | | Cut every string in the result to this many characters, followed by `…[+N chars]` (JMESPath has no substring function) |
 
 ### json_transform
 
@@ -108,6 +109,7 @@ Query newline-delimited JSON (JSONL/NDJSON) — transcripts, logs, exports — o
 | `parse_nested` | boolean? | `false` | Recursively parse JSON strings embedded inside record values |
 | `include_source` | boolean? | `false` | Tag each per-record result with its source file as `{source, value}` |
 | `limit` | number? | `100` | Max results (records or groups) to return |
+| `max_string_length` | number? | | Cut every string in each result to this many characters, followed by `…[+N chars]`, for a compact view of long text fields |
 
 #### Examples
 

@@ -573,6 +573,31 @@ function deepParseJson(data: unknown, depth = 0): unknown {
   return data;
 }
 
+/** Cut every string in a result to `max` characters, noting how much was cut.
+ *  JMESPath has no substring function, so this is the only way to keep long
+ *  text fields in a compact projection. */
+function truncateStrings(data: unknown, max: number, depth = 0): unknown {
+  if (depth > MAX_DEPTH) {
+    throw new Error(`Maximum nesting depth (${MAX_DEPTH}) exceeded`);
+  }
+  if (typeof data === "string") {
+    return data.length > max
+      ? data.slice(0, max) + `…[+${data.length - max} chars]`
+      : data;
+  }
+  if (Array.isArray(data)) {
+    return data.map((item) => truncateStrings(item, max, depth + 1));
+  }
+  if (data && typeof data === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      result[key] = truncateStrings(value, max, depth + 1);
+    }
+    return result;
+  }
+  return data;
+}
+
 /** Apply find/replace pairs to every string value in a JSON tree. */
 function deepReplace(
   data: unknown,
@@ -1083,9 +1108,18 @@ server.registerTool(
       .optional()
       .default(50)
       .describe("Max array items to return"),
+    max_string_length: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Cut every string in the result to this many characters, followed by " +
+          "…[+N chars] (JMESPath has no substring function)"
+      ),
   }).strict(),
   },
-  async ({ file_path, text, expression, parse_nested, limit }) => {
+  async ({ file_path, text, expression, parse_nested, limit, max_string_length }) => {
     const raw = await resolveContent(file_path, text);
     let data: unknown = JSON.parse(raw);
 
@@ -1098,6 +1132,7 @@ server.registerTool(
     if (Array.isArray(result) && result.length > limit) {
       result = result.slice(0, limit);
     }
+    if (max_string_length) result = truncateStrings(result, max_string_length);
 
     return textResult(JSON.stringify(result, null, 2));
   }
@@ -1561,6 +1596,16 @@ server.registerTool(
       .optional()
       .default(100)
       .describe("Max results (records or groups) to return"),
+    max_string_length: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "Cut every string in each result to this many characters, followed by " +
+          "…[+N chars]. Use it for a compact per-record view of long text fields " +
+          "(JMESPath has no substring function)"
+      ),
   }).strict(),
   },
   async ({
@@ -1577,6 +1622,7 @@ server.registerTool(
     parse_nested,
     include_source,
     limit,
+    max_string_length,
   }) => {
     // Read and process one source at a time, so memory holds a single file
     // rather than the whole glob (a multi-GB glob otherwise OOMs the server).
@@ -1626,7 +1672,8 @@ server.registerTool(
             agg !== "count" && agg_field ? jmespath.search(rec, agg_field) : undefined
           );
         } else {
-          const value = expression ? jmespath.search(rec, expression) : rec;
+          let value = expression ? jmespath.search(rec, expression) : rec;
+          if (max_string_length) value = truncateStrings(value, max_string_length);
           records.push(include_source ? { source: label, value } : value);
           if (records.length >= limit) break outer; // nothing more to collect
         }
