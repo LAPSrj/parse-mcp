@@ -1109,8 +1109,8 @@ const ALIASES: Record<string, string[]> = {
 /** Extra advice for a parameter a tool doesn't have. */
 const HINTS: Record<string, Record<string, string>> = {
   text_replace: {
-    paths: "text_replace edits one file per call: pass file_path and call it once per file.",
-    glob: "text_replace edits one file per call: list the files with file_list, then call it once per file.",
+    paths: "text_replace takes one file (file_path). To edit several files, use the Write tool.",
+    glob: "text_replace takes one file (file_path). To edit several files, use the Write tool.",
   },
   json_transform: {
     paths: "json_transform edits one file per call: pass file_path and call it once per file.",
