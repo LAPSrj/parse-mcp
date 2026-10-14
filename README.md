@@ -103,6 +103,8 @@ Query newline-delimited JSON (JSONL/NDJSON) — transcripts, logs, exports — o
 | `expression` | string? | | JMESPath applied to each record (default: the whole record) |
 | `filter` | string? | | JMESPath boolean; records kept only when it evaluates truthy |
 | `group_by` | string? | | JMESPath key expression; returns `{scanned, matched, groups: [{key, count}]}` sorted by count desc (like `GROUP BY`) |
+| `agg` | string? | `"count"` | `count`, `sum`, `avg`, `min`, `max`. The last four need `agg_field`, add the value to each group (`{key, count, sum}`), and sort groups by it desc |
+| `agg_field` | string? | | JMESPath for the numeric value to aggregate per record (e.g. `message.usage.output_tokens`); missing and non-numeric values are skipped |
 | `parse_nested` | boolean? | `false` | Recursively parse JSON strings embedded inside record values |
 | `include_source` | boolean? | `false` | Tag each per-record result with its source file as `{source, value}` |
 | `limit` | number? | `100` | Max results (records or groups) to return |
@@ -115,6 +117,17 @@ Aggregate message roles across every transcript in a directory:
 {
   "glob": "/path/to/transcripts/*.jsonl",
   "group_by": "message.role"
+}
+```
+
+Total output tokens per model:
+
+```json
+{
+  "glob": "/path/to/transcripts/*.jsonl",
+  "group_by": "message.model",
+  "agg": "sum",
+  "agg_field": "message.usage.output_tokens"
 }
 ```
 
@@ -145,8 +158,8 @@ Query delimited text (CSV / TSV / whitespace columns) — select columns, filter
 | `filter` | string? | | JMESPath boolean over the row object; rows kept only when truthy |
 | `expression` | string? | | JMESPath applied to each row object (overrides `columns`) |
 | `group_by` | string? | | JMESPath key expression; returns aggregated groups instead of rows |
-| `agg` | string? | `"count"` | `count`, `sum`, `avg`, `min`, `max` (the last four need `agg_field`) |
-| `agg_field` | string? | | Column to aggregate numerically when `agg` is sum/avg/min/max |
+| `agg` | string? | `"count"` | `count`, `sum`, `avg`, `min`, `max` (the last four need `agg_field`, and groups are then sorted by that value desc) |
+| `agg_field` | string? | | Column to aggregate numerically when `agg` is sum/avg/min/max; empty and non-numeric cells are skipped |
 | `limit` | number? | `100` | Max rows or groups to return |
 
 #### Example

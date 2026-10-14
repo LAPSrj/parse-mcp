@@ -977,20 +977,80 @@ function rowsToObjects(
     });
 }
 
-/** Aggregate a numeric column. */
-function aggregateValues(values: number[], op: string): number {
+/** Running numeric aggregate for one group. Kept as running totals rather than
+ *  an array of values: Math.min(...values) overflows the call stack past ~120k
+ *  values, and the array alone grows with the input. */
+interface Acc {
+  n: number;
+  sum: number;
+  min: number;
+  max: number;
+}
+
+/** One group's count plus its running aggregate. */
+type Group = { count: number; acc: Acc };
+
+/** Count a record into its group and fold its numeric value (if any) in. */
+function addToGroup(groups: Map<string, Group>, key: unknown, value: unknown): void {
+  const keyStr =
+    key === null || key === undefined
+      ? "null"
+      : typeof key === "object"
+      ? JSON.stringify(key)
+      : String(key);
+  let g = groups.get(keyStr);
+  if (!g) {
+    g = { count: 0, acc: { n: 0, sum: 0, min: Infinity, max: -Infinity } };
+    groups.set(keyStr, g);
+  }
+  g.count++;
+  if (value === undefined || value === null || value === "") return;
+  const n = Number(value);
+  if (Number.isNaN(n)) return;
+  g.acc.n++;
+  g.acc.sum += n;
+  if (n < g.acc.min) g.acc.min = n;
+  if (n > g.acc.max) g.acc.max = n;
+}
+
+/** Final value of an aggregate. Groups with no numeric values report 0. */
+function aggregateValue(acc: Acc, op: string): number {
+  if (!acc.n) return 0;
   switch (op) {
     case "sum":
-      return values.reduce((a, b) => a + b, 0);
+      return acc.sum;
     case "avg":
-      return values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+      return acc.sum / acc.n;
     case "min":
-      return values.length ? Math.min(...values) : 0;
+      return acc.min;
     case "max":
-      return values.length ? Math.max(...values) : 0;
+      return acc.max;
     default:
-      return values.length;
+      return acc.n;
   }
+}
+
+/** Groups as [{key, count, <agg>?}], sorted by the aggregate when there is one
+ *  (so "sum of tokens per model" lists the biggest total first), else by count. */
+function finalizeGroups(
+  groups: Map<string, Group>,
+  agg: string,
+  hasField: boolean,
+  limit: number
+): Array<Record<string, unknown>> {
+  const withAgg = agg !== "count" && hasField;
+  return [...groups.entries()]
+    .map(([key, g]) => {
+      const out: Record<string, unknown> = { key, count: g.count };
+      if (withAgg) out[agg] = aggregateValue(g.acc, agg);
+      return out;
+    })
+    .sort((a, b) =>
+      withAgg
+        ? (b[agg] as number) - (a[agg] as number)
+        : (b.count as number) - (a.count as number)
+    )
+    .slice(0, limit);
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,6 +1529,21 @@ server.registerTool(
         "JMESPath key expression; when set, returns [{key, count}] sorted by " +
           "count desc (like awk/GROUP BY) instead of per-record results"
       ),
+    agg: z
+      .enum(["count", "sum", "avg", "min", "max"])
+      .optional()
+      .default("count")
+      .describe(
+        "Aggregation for group_by. sum/avg/min/max need agg_field and add that " +
+          "value to each group as {key, count, sum}, sorted by it desc"
+      ),
+    agg_field: z
+      .string()
+      .optional()
+      .describe(
+        "JMESPath for the numeric value to aggregate per record " +
+          "(e.g. 'message.usage.output_tokens'); non-numeric values are skipped"
+      ),
     parse_nested: z
       .boolean()
       .optional()
@@ -1497,6 +1572,8 @@ server.registerTool(
     expression,
     filter,
     group_by,
+    agg,
+    agg_field,
     parse_nested,
     include_source,
     limit,
@@ -1510,7 +1587,7 @@ server.registerTool(
     const total = files ? files.length : 1;
     const deadline = Date.now() + CALL_BUDGET_MS;
 
-    const groups = new Map<string, number>();
+    const groups = new Map<string, Group>();
     const records: unknown[] = [];
     let scanned = 0;
     let matched = 0;
@@ -1543,14 +1620,11 @@ server.registerTool(
         if (filter && !jmesTruthy(jmespath.search(rec, filter))) continue;
         matched++;
         if (group_by) {
-          const key = jmespath.search(rec, group_by);
-          const keyStr =
-            key === null || key === undefined
-              ? "null"
-              : typeof key === "object"
-              ? JSON.stringify(key)
-              : String(key);
-          groups.set(keyStr, (groups.get(keyStr) || 0) + 1);
+          addToGroup(
+            groups,
+            jmespath.search(rec, group_by),
+            agg !== "count" && agg_field ? jmespath.search(rec, agg_field) : undefined
+          );
         } else {
           const value = expression ? jmespath.search(rec, expression) : rec;
           records.push(include_source ? { source: label, value } : value);
@@ -1561,10 +1635,7 @@ server.registerTool(
     }
 
     if (group_by) {
-      const sorted = [...groups.entries()]
-        .map(([key, count]) => ({ key, count }))
-        .sort((a, b) => b.count - a.count)
-        .slice(0, limit);
+      const sorted = finalizeGroups(groups, agg, !!agg_field, limit);
       return textResult(
         JSON.stringify(
           { scanned, matched, ...(note ? { note } : {}), groups: sorted },
@@ -1749,8 +1820,7 @@ server.registerTool(
         : await resolvePaths({ file_path, paths, glob, cwd });
     const total = files ? files.length : 1;
     const deadline = Date.now() + CALL_BUDGET_MS;
-    const counts = new Map<string, number>();
-    const nums = new Map<string, number[]>();
+    const groups = new Map<string, Group>();
     const kept: Array<Record<string, string>> = [];
     let scanned = 0;
     let matched = 0;
@@ -1777,37 +1847,26 @@ server.registerTool(
           if (kept.length < limit) kept.push(r);
           continue;
         }
-        const key = jmespath.search(r, group_by);
-        const keyStr =
-          key === null || key === undefined
-            ? "null"
-            : typeof key === "object"
-            ? JSON.stringify(key)
-            : String(key);
-        counts.set(keyStr, (counts.get(keyStr) || 0) + 1);
-        if (agg !== "count" && agg_field) {
-          const n = Number(r[agg_field]);
-          if (!Number.isNaN(n)) {
-            if (!nums.has(keyStr)) nums.set(keyStr, []);
-            nums.get(keyStr)!.push(n);
-          }
-        }
+        addToGroup(
+          groups,
+          jmespath.search(r, group_by),
+          agg !== "count" && agg_field ? r[agg_field] : undefined
+        );
       }
     }
 
     if (group_by) {
-      const groups = [...counts.entries()]
-        .map(([key, count]) => {
-          const out: Record<string, unknown> = { key, count };
-          if (agg !== "count" && agg_field) {
-            out[agg] = aggregateValues(nums.get(key) || [], agg);
-          }
-          return out;
-        })
-        .sort((a, b) => (b.count as number) - (a.count as number))
-        .slice(0, limit);
       return textResult(
-        JSON.stringify({ scanned, matched, ...(note ? { note } : {}), groups }, null, 2)
+        JSON.stringify(
+          {
+            scanned,
+            matched,
+            ...(note ? { note } : {}),
+            groups: finalizeGroups(groups, agg, !!agg_field, limit),
+          },
+          null,
+          2
+        )
       );
     }
 
