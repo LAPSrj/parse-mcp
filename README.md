@@ -4,7 +4,7 @@ MCP server with scoped, read-only parsing tools (JSON, JSONL, CSV/TSV, regex, HT
 
 ## Tools
 
-Agents often guess parameter names from other tools, so the server renames the common guesses before validating a call: `path`/`file`/`filepath`/`filename` → `file_path`, `query`/`expr`/`jmespath` → `expression`, `max_matches`/`max_results`/`max_count`/`max_items`/`head_limit` → `limit`, `dir`/`directory` → `cwd` (or file_list's `path`), `pattern` → `glob` and `cwd` → `path` on file_list, `regex` → `pattern` on regex_extract, `ignore_case`/`case_insensitive: true` → the `i` flag, a top-level `find`/`replace` pair → text_replace's `replacements`, and a one-element `paths` → `file_path` on single-file tools. A rename applies only when the tool doesn't have a parameter of that name. Any other unknown parameter fails with an error that lists the tool's valid parameters.
+Agents often guess parameter names from other tools, so the server renames the common guesses before validating a call: `path`/`file`/`filepath`/`filename` → `file_path`, `query`/`expr`/`jmespath` → `expression`, `max_matches`/`max_results`/`max_count`/`max_items`/`head_limit` → `limit`, `dir`/`directory` → `cwd` (or file_list's `path`), `pattern` → `glob` and `cwd` → `path` on file_list, `regex` → `pattern` on regex_extract, `ignore_case`/`case_insensitive: true` → the `i` flag, `context` → `context_lines` on regex_extract, a top-level `find`/`replace` pair → text_replace's `replacements`, and a one-element `paths` → `file_path` on single-file tools. A rename applies only when the tool doesn't have a parameter of that name. Any other unknown parameter fails with an error that lists the tool's valid parameters.
 
 ### json_query
 
@@ -201,6 +201,9 @@ With a single `file_path`/`text`, returns the matches directly. With a glob or p
 | `limit` | number? | `50` | Max matches to return |
 | `count_only` | boolean? | `false` | Return `{count}` instead of matches (like `grep -c`). With `glob`/`paths`, the response also has `total` across all files |
 | `unique` | boolean? | `false` | Deduplicate matches, return `[{match, count}]` sorted by frequency (like `sort \| uniq -c`). With `glob`/`paths`, returns one list across all files, `{scanned, matched, distinct, results: [{match, count, files}]}`, where `files` is how many files contain the match |
+| `with_lines` | boolean? | `false` | Return `{line, match}` with the 1-based line number (like `grep -n`). With `group`, the line points at that capture group |
+| `with_cols` | boolean? | `false` | Also return the 1-based column as `{line, col, match}` (like `rg --column`). Requires `with_lines` |
+| `context_lines` | number? | `0` | Lines of context around each match (like `grep -C`). Implies `with_lines` and adds `text` (the whole matching line) plus `before`/`after` arrays. Ignored with `count_only` or `unique` |
 
 ### html_select
 

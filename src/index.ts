@@ -86,45 +86,66 @@ function textResult(payload: string) {
 // ruinous once per file — a 76k-file glob spent ~22 minutes on spawns alone to
 // guard a regex that took 0.13s in total. So the multi-file path uses ONE
 // worker for the whole batch (SCAN_WORKER below), not one per file.
-const REGEX_WORKER = `
-const { parentPort, workerData } = require('worker_threads');
-try {
-  const { content, pattern, flags, group, count_only, collectLimit, with_lines, with_cols } = workerData;
-  const hasGroup = group !== undefined && group !== null;
-  // 'd' flag exposes m.indices so we can locate the requested capture group.
-  const matchFlags = with_lines && hasGroup && !flags.includes('d') ? flags + 'd' : flags;
-  const regex = new RegExp(pattern, matchFlags);
+//
+// SCAN_CORE is the scanner both workers share: makeScanner(workerData) returns
+// scanOne(content), which yields { count } or { matches }.
+const SCAN_CORE = `
+function buildLineStarts(content) {
+  const starts = [0];
+  for (let i = 0; i < content.length; i++)
+    if (content[i] === '\\n') starts.push(i + 1);
+  return starts;
+}
+function lineOf(starts, idx) { // largest starts[k] <= idx -> line k+1
+  let lo = 0, hi = starts.length - 1, ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (starts[mid] <= idx) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return ans;
+}
+function lineText(content, starts, k) { // line k (0-based) without its EOL
+  const end = k + 1 < starts.length ? starts[k + 1] - 1 : content.length;
+  const s = content.slice(starts[k], end);
+  return s.endsWith('\\r') ? s.slice(0, -1) : s;
+}
+
+function makeScanner(o) {
+  const { pattern, flags, group, count_only, collectLimit, with_lines, with_cols } = o;
+  const context = o.context || 0;
   const isGlobal = flags.includes('g');
-  const buildLineStarts = (s) => {
-    const starts = [0];
-    for (let i = 0; i < s.length; i++) if (s[i] === '\\n') starts.push(i + 1);
-    return starts;
-  };
-  const lineOf = (starts, idx) => {
-    let lo = 0, hi = starts.length - 1, ans = 0;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (starts[mid] <= idx) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+  const hasGroup = group !== undefined && group !== null;
+  // The 'd' flag makes m.indices available so we can report the LOCATION of the
+  // requested capture group, not just the whole match. Only needed when locating
+  // a specific group; skipped otherwise to avoid the indices-tracking overhead.
+  const wantGroupPos = with_lines && hasGroup;
+  const matchFlags = wantGroupPos && !flags.includes('d') ? flags + 'd' : flags;
+
+  return function scanOne(content) {
+    const regex = new RegExp(pattern, matchFlags);
+    if (count_only) {
+      let count = 0, m;
+      while ((m = regex.exec(content)) !== null) {
+        count++;
+        if (m[0] === '' && isGlobal) regex.lastIndex++;
+        if (!isGlobal) break;
+        if (count >= 1000000) break;
+      }
+      return { count: count };
     }
-    return ans;
-  };
-  if (count_only) {
-    let count = 0, m;
-    while ((m = regex.exec(content)) !== null) {
-      count++;
-      if (m[0] === '' && isGlobal) regex.lastIndex++;
-      if (!isGlobal) break;
-      if (count >= 1000000) break;
-    }
-    parentPort.postMessage({ result: { count } });
-  } else {
     const starts = with_lines ? buildLineStarts(content) : null;
+    // A trailing newline leaves an empty "line" after it; context stops before it.
+    const lastLine = starts
+      ? starts.length - 1 - (content.endsWith('\\n') ? 1 : 0)
+      : 0;
     const matches = [];
     let m;
     while ((m = regex.exec(content)) !== null && matches.length < collectLimit) {
       let value, idx;
       if (hasGroup && m[group] !== undefined) {
         value = m[group];
+        // m.indices[group] is the group's own [start,end]; undefined if the group
+        // didn't participate, in which case value already fell back to m[0].
         idx = (m.indices && m.indices[group]) ? m.indices[group][0] : m.index;
       } else {
         value = m[0];
@@ -134,6 +155,15 @@ try {
         const li = lineOf(starts, idx);
         const entry = { line: li + 1, match: value };
         if (with_cols) entry.col = idx - starts[li] + 1;
+        if (context > 0) { // like grep -C: the whole line plus its neighbours
+          entry.text = lineText(content, starts, li);
+          entry.before = [];
+          for (let k = Math.max(0, li - context); k < li; k++)
+            entry.before.push(lineText(content, starts, k));
+          entry.after = [];
+          for (let k = li + 1; k <= Math.min(lastLine, li + context); k++)
+            entry.after.push(lineText(content, starts, k));
+        }
         matches.push(entry);
       } else {
         matches.push(value);
@@ -141,8 +171,16 @@ try {
       if (m[0] === '' && isGlobal) regex.lastIndex++;
       if (!isGlobal) break;
     }
-    parentPort.postMessage({ result: { matches } });
-  }
+    return { matches: matches };
+  };
+}
+`;
+
+const REGEX_WORKER = `
+const { parentPort, workerData } = require('worker_threads');
+${SCAN_CORE}
+try {
+  parentPort.postMessage({ result: makeScanner(workerData)(workerData.content) });
 } catch (e) {
   parentPort.postMessage({ error: e.message });
 }
@@ -160,73 +198,9 @@ try {
 const SCAN_WORKER = `
 const { parentPort, workerData } = require('worker_threads');
 const { readFileSync, statSync } = require('fs');
-const {
-  files, sizes, pattern, flags, group, count_only, collectLimit, maxInputBytes,
-  with_lines, with_cols
-} = workerData;
-const isGlobal = flags.includes('g');
-
-function buildLineStarts(content) {
-  const starts = [0];
-  for (let i = 0; i < content.length; i++)
-    if (content[i] === '\\n') starts.push(i + 1);
-  return starts;
-}
-function lineOf(starts, idx) { // largest starts[k] <= idx -> line k+1
-  let lo = 0, hi = starts.length - 1, ans = 0;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (starts[mid] <= idx) { ans = mid; lo = mid + 1; } else hi = mid - 1;
-  }
-  return ans;
-}
-
-const hasGroup = group !== undefined && group !== null;
-// The 'd' flag makes m.indices available so we can report the LOCATION of the
-// requested capture group, not just the whole match. Only needed when locating
-// a specific group; skipped otherwise to avoid the indices-tracking overhead.
-const wantGroupPos = with_lines && hasGroup;
-const matchFlags = wantGroupPos && !flags.includes('d') ? flags + 'd' : flags;
-
-function scanOne(content) {
-  const regex = new RegExp(pattern, matchFlags);
-  if (count_only) {
-    let count = 0, m;
-    while ((m = regex.exec(content)) !== null) {
-      count++;
-      if (m[0] === '' && isGlobal) regex.lastIndex++;
-      if (!isGlobal) break;
-      if (count >= 1000000) break;
-    }
-    return { count: count };
-  }
-  const starts = with_lines ? buildLineStarts(content) : null;
-  const matches = [];
-  let m;
-  while ((m = regex.exec(content)) !== null && matches.length < collectLimit) {
-    let value, idx;
-    if (hasGroup && m[group] !== undefined) {
-      value = m[group];
-      // m.indices[group] is the group's own [start,end]; undefined if the group
-      // didn't participate, in which case value already fell back to m[0].
-      idx = (m.indices && m.indices[group]) ? m.indices[group][0] : m.index;
-    } else {
-      value = m[0];
-      idx = m.index;
-    }
-    if (with_lines) {
-      const li = lineOf(starts, idx);
-      const entry = { line: li + 1, match: value };
-      if (with_cols) entry.col = idx - starts[li] + 1;
-      matches.push(entry);
-    } else {
-      matches.push(value);
-    }
-    if (m[0] === '' && isGlobal) regex.lastIndex++;
-    if (!isGlobal) break;
-  }
-  return { matches: matches };
-}
+const { files, sizes, pattern, flags, count_only, maxInputBytes } = workerData;
+${SCAN_CORE}
+const scanOne = makeScanner(workerData);
 
 try {
   new RegExp(pattern, flags); // fail fast rather than once per file
@@ -315,11 +289,21 @@ interface RegexOpts {
   unique: boolean;
   with_lines: boolean;
   with_cols: boolean;
+  /** Lines of context before/after each match (like grep -C); 0 = none. */
+  context: number;
 }
 
 /** A located match when with_lines is set: the text plus its 1-based line (and
- *  1-based column when with_cols is set). */
-type LocatedMatch = { line: number; col?: number; match: string };
+ *  1-based column when with_cols is set). With context, also the whole line
+ *  and its neighbours. */
+type LocatedMatch = {
+  line: number;
+  col?: number;
+  match: string;
+  text?: string;
+  before?: string[];
+  after?: string[];
+};
 
 interface BatchOutcome {
   entries: Array<{ i: number; entry: { result?: RawScan; error?: string } }>;
@@ -359,6 +343,7 @@ function scanBatch(
         maxInputBytes: MAX_INPUT_BYTES,
         with_lines: opts.with_lines,
         with_cols: opts.with_cols,
+        context: opts.context,
       },
     });
 
@@ -1118,6 +1103,7 @@ const ALIASES: Record<string, string[]> = {
   cwd: ["path"],
   pattern: ["glob"],
   regex: ["pattern"],
+  context: ["context_lines"],
 };
 
 /** Extra advice for a parameter a tool doesn't have. */
@@ -1334,12 +1320,12 @@ server.registerTool(
  *  file_path). One worker per call is fine here — it's one call. The multi-file
  *  path goes through scanFiles() instead, which must not pay this per file. */
 async function runRegex(content: string, opts: RegexOpts): Promise<unknown> {
-  const { pattern, flags, group, limit, count_only, unique, with_lines, with_cols } = opts;
+  const { pattern, flags, group, limit, count_only, unique, with_lines, with_cols, context } = opts;
   const collectLimit = unique ? 10_000 : limit;
 
   const out = await runInWorker<RawScan>(
     REGEX_WORKER,
-    { content, pattern, flags, group, count_only, collectLimit, with_lines, with_cols },
+    { content, pattern, flags, group, count_only, collectLimit, with_lines, with_cols, context },
     REGEX_TIMEOUT_MS
   );
 
@@ -1424,6 +1410,17 @@ server.registerTool(
         "Also include the 1-based column of the match start as {line, col, match} " +
           "(like ripgrep --column). Requires with_lines."
       ),
+    context_lines: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .default(0)
+      .describe(
+        "Lines of context around each match (like grep -C). Implies with_lines " +
+          "and adds the whole matching line as text plus before/after arrays. " +
+          "Ignored when count_only or unique is set."
+      ),
   }),
   },
   async ({
@@ -1440,15 +1437,18 @@ server.registerTool(
     unique,
     with_lines,
     with_cols,
+    context_lines,
   }) => {
+    const lines = with_lines || context_lines > 0;
     const opts: RegexOpts = {
       ...normalizeRegex(pattern, flags),
       group,
       limit,
       count_only,
       unique,
-      with_lines,
-      with_cols: with_lines && with_cols,
+      with_lines: lines,
+      with_cols: lines && with_cols,
+      context: context_lines,
     };
     const multi = (paths && paths.length) || glob;
 
@@ -1457,7 +1457,14 @@ server.registerTool(
       if (opts.unique) {
         // One frequency list across every file (like grep -rho | sort | uniq -c),
         // so collect each file's raw matches and merge them here.
-        const raw = { ...opts, unique: false, limit: 10_000, with_lines: false, with_cols: false };
+        const raw = {
+          ...opts,
+          unique: false,
+          limit: 10_000,
+          with_lines: false,
+          with_cols: false,
+          context: 0,
+        };
         const { results, scanned, note } = await scanFiles(files, raw);
         const freq = new Map<string, { count: number; files: number }>();
         const errors: Array<{ file: string; error: string }> = [];
